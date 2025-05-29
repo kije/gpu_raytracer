@@ -11,3 +11,4 @@ crate-type = [ "dylib"]
 spirv-std = { version = "0.9" }
 glam = { version = "0.29", default-features = false, features = ["libm"] }
 bytemuck = { version = "1.19", features = ["derive"] }
+raytracer-shared = { path = "../shared", features = ["shader"] }

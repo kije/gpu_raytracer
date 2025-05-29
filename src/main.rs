@@ -5,36 +5,10 @@ use winit::{
     event_loop::EventLoop,
     window::WindowBuilder,
 };
-use bytemuck::{Pod, Zeroable};
+use bytemuck;
 use wgpu::{TextureUsages, util::make_spirv};
-use glam::{Vec3, vec3};
+use raytracer_shared::{Camera, Sphere, PushConstants};
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Camera {
-    position: [f32; 3],
-    direction: [f32; 3],
-    up: [f32; 3],
-    fov: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Sphere {
-    center: [f32; 3],
-    radius: f32,
-    color: [f32; 3],
-    material: u32, // 0=diffuse, 1=metal, 2=glass
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct PushConstants {
-    resolution: [f32; 2],
-    time: f32,
-    camera: Camera,
-    sphere_count: u32,
-}
 
 struct State {
     surface: wgpu::Surface,
@@ -67,7 +41,14 @@ struct State {
     last_compute_time: std::time::Duration,
     frame_count: u64,
     
+    // Progressive tile rendering
     needs_recompute: bool,
+    tile_size: u32,
+    tiles_x: u32,
+    tiles_y: u32,
+    current_tile: u32,
+    is_progressive_rendering: bool,
+    progressive_start_time: std::time::Instant,
 }
 
 impl State {
@@ -161,33 +142,13 @@ impl State {
         });
 
         // Initialize default camera
-        let camera = Camera {
-            position: [0.0, 0.0, 5.0],
-            direction: [0.0, 0.0, -1.0],
-            up: [0.0, 1.0, 0.0],
-            fov: 45.0,
-        };
+        let camera = Camera::new();
 
         // Initialize default scene
         let spheres = vec![
-            Sphere {
-                center: [0.0, 0.0, -1.0],
-                radius: 0.5,
-                color: [0.8, 0.3, 0.3],
-                material: 0, // diffuse
-            },
-            Sphere {
-                center: [-1.0, 0.0, -1.0],
-                radius: 0.5,
-                color: [0.8, 0.8, 0.2],
-                material: 1, // metal
-            },
-            Sphere {
-                center: [1.0, 0.0, -1.0],
-                radius: 0.5,
-                color: [0.2, 0.3, 0.8],
-                material: 2, // glass
-            },
+            Sphere::new([0.0, 0.0, -1.0], 0.5, [0.8, 0.3, 0.3], 0),
+            Sphere::new([-1.0, 0.0, -1.0], 0.5, [0.8, 0.8, 0.2], 1),
+            Sphere::new([1.0, 0.0, -1.0], 0.5, [0.2, 0.3, 0.8], 2),
         ];
 
         // Create spheres buffer
@@ -341,6 +302,11 @@ impl State {
             multiview: None,
         });
 
+        // Calculate tile layout
+        let tile_size = 64; // 64x64 pixel tiles
+        let tiles_x = (size.width + tile_size - 1) / tile_size;
+        let tiles_y = (size.height + tile_size - 1) / tile_size;
+
         Self {
             surface,
             device,
@@ -362,6 +328,12 @@ impl State {
             last_compute_time: std::time::Duration::ZERO,
             frame_count: 0,
             needs_recompute: true,
+            tile_size,
+            tiles_x,
+            tiles_y,
+            current_tile: 0,
+            is_progressive_rendering: false,
+            progressive_start_time: std::time::Instant::now(),
         }
     }
 
@@ -372,6 +344,9 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
+            // Recalculate tile layout
+            self.tiles_x = (new_size.width + self.tile_size - 1) / self.tile_size;
+            self.tiles_y = (new_size.height + self.tile_size - 1) / self.tile_size;
 
             // Recreate raytraced texture
             self.raytraced_texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -393,6 +368,8 @@ impl State {
             self.recreate_bind_groups();
 
             self.needs_recompute = true;
+            self.current_tile = 0;
+            self.is_progressive_rendering = false;
         }
     }
     
@@ -437,11 +414,42 @@ impl State {
     }
     
     fn run_compute(&mut self) {
-        if !self.needs_recompute {
+        // Start progressive rendering if we need to recompute
+        if self.needs_recompute && !self.is_progressive_rendering {
+            self.is_progressive_rendering = true;
+            self.current_tile = 0;
+            self.progressive_start_time = std::time::Instant::now();
+            self.needs_recompute = false;
+            
+            println!("Starting progressive render: {}x{} tiles", self.tiles_x, self.tiles_y);
+        }
+        
+        // Continue progressive rendering if in progress
+        if !self.is_progressive_rendering {
+            return;
+        }
+
+        let total_tiles = self.tiles_x * self.tiles_y;
+        if self.current_tile >= total_tiles {
+            // Progressive rendering completed
+            self.is_progressive_rendering = false;
+            let total_time = self.progressive_start_time.elapsed();
+            println!("Progressive render completed in {:.2}ms", total_time.as_secs_f32() * 1000.0);
             return;
         }
 
         let compute_start = std::time::Instant::now();
+        
+        // Calculate current tile position
+        let tile_x = self.current_tile % self.tiles_x;
+        let tile_y = self.current_tile / self.tiles_x;
+        
+        let tile_offset_x = tile_x * self.tile_size;
+        let tile_offset_y = tile_y * self.tile_size;
+        
+        // Calculate actual tile size (handle edge tiles)
+        let actual_tile_width = std::cmp::min(self.tile_size, self.size.width - tile_offset_x);
+        let actual_tile_height = std::cmp::min(self.tile_size, self.size.height - tile_offset_y);
         
         let mut encoder = self
             .device
@@ -469,22 +477,32 @@ impl State {
                 time: self.start_time.elapsed().as_secs_f32(),
                 camera: self.camera,
                 sphere_count: self.spheres.len() as u32,
+                tile_offset: [tile_offset_x, tile_offset_y],
+                tile_size: [actual_tile_width, actual_tile_height],
+                total_tiles: [self.tiles_x, self.tiles_y],
+                current_tile_index: self.current_tile,
             };
             compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 
-            let workgroup_x = (self.size.width + 15) / 16;
-            let workgroup_y = (self.size.height + 15) / 16;
+            // Dispatch workgroups for current tile
+            let workgroup_x = (actual_tile_width + 15) / 16;
+            let workgroup_y = (actual_tile_height + 15) / 16;
             compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
         }
 
-
         self.queue.submit(std::iter::once(encoder.finish()));
         
-        // Wait for GPU to finish and measure time
-        self.device.poll(wgpu::Maintain::Wait);
+        // Don't wait for GPU - allow frame to be displayed immediately
         self.last_compute_time = compute_start.elapsed();
         
-        self.needs_recompute = false;
+        // Move to next tile
+        self.current_tile += 1;
+        
+        // Progress feedback
+        if self.current_tile % 4 == 0 || self.current_tile == total_tiles {
+            let progress = (self.current_tile as f32 / total_tiles as f32) * 100.0;
+            println!("Progress: {:.1}% ({}/{})", progress, self.current_tile, total_tiles);
+        }
     }
 
     pub fn trigger_recompute(&mut self) {
@@ -520,6 +538,8 @@ impl State {
         }
         
         self.needs_recompute = true;
+        self.current_tile = 0;
+        self.is_progressive_rendering = false;
     }
     
     fn move_camera(&mut self, forward: f32, right: f32) {
@@ -542,6 +562,8 @@ impl State {
         self.camera.position[2] += right_vec[2] * right * speed;
         
         self.needs_recompute = true;
+        self.current_tile = 0;
+        self.is_progressive_rendering = false;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {

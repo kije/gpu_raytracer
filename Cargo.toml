@@ -15,6 +15,7 @@ ahash = "=0.7.8"
 wgpu-core = "=0.16.0"
 wgpu-hal = "=0.16.0"
 gpu-descriptor = "=0.2.0"
+raytracer-shared = { path = "shared" }
 
 [build-dependencies]
 spirv-builder = { version = "0.9", features = ["watch", "use-installed-tools"], default-features = false }
@@ -26,7 +27,7 @@ ahash = { git = "https://github.com/tkaitchuck/aHash.git", tag = "v0.7.8", versi
 gpu-descriptor = { git = "https://github.com/zakarumych/gpu-descriptor.git", tag = "v0.2.0", version = "0.2.0"  }
 
 [workspace]
-members = ["shader"]
+members = ["shader", "shared"]
 
 [profile.release.build-override]
 opt-level = 3
