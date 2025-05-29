@@ -49,6 +49,7 @@ struct State {
     current_tile: u32,
     is_progressive_rendering: bool,
     progressive_start_time: std::time::Instant,
+    tiles_per_frame: u32, // Number of tiles to process in parallel per frame
 }
 
 impl State {
@@ -149,6 +150,9 @@ impl State {
             Sphere::new([0.0, 0.0, -1.0], 0.5, [0.8, 0.3, 0.3], 0),
             Sphere::new([-1.0, 0.0, -1.0], 0.5, [0.8, 0.8, 0.2], 1),
             Sphere::new([1.0, 0.0, -1.0], 0.5, [0.2, 0.3, 0.8], 2),
+            Sphere::new([2.0, 0.0, -3.0], 0.5, [0.2, 0.3, 0.8], 2),
+            Sphere::new([-2.0, 0.0, -4.0], 0.5, [0.2, 0.3, 0.8], 1),
+            Sphere::new([-1.0, 2.0, -5.0], 0.5, [0.2, 0.3, 0.8], 1),
         ];
 
         // Create spheres buffer
@@ -306,6 +310,16 @@ impl State {
         let tile_size = 64; // 64x64 pixel tiles
         let tiles_x = (size.width + tile_size - 1) / tile_size;
         let tiles_y = (size.height + tile_size - 1) / tile_size;
+        let total_tiles = tiles_x * tiles_y;
+        
+        // Calculate adaptive tiles per frame based on total tile count
+        let tiles_per_frame = match total_tiles {
+            0..=16 => total_tiles,        // Render all at once for small images
+            17..=64 => total_tiles / 2,   // 2 batches for medium images  
+            65..=256 => 64,               // More aggressive for larger images
+            257..=1024 => 128,            // Even more aggressive for very large images
+            _ => 256,                     // Maximum parallelism for huge images
+        }.max(1); // Ensure at least 1 tile per frame
 
         Self {
             surface,
@@ -334,6 +348,7 @@ impl State {
             current_tile: 0,
             is_progressive_rendering: false,
             progressive_start_time: std::time::Instant::now(),
+            tiles_per_frame, // Adaptive tiles per frame based on total tile count
         }
     }
 
@@ -344,9 +359,18 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
-            // Recalculate tile layout
+            // Recalculate tile layout and adaptive tiles per frame
             self.tiles_x = (new_size.width + self.tile_size - 1) / self.tile_size;
             self.tiles_y = (new_size.height + self.tile_size - 1) / self.tile_size;
+            let total_tiles = self.tiles_x * self.tiles_y;
+            
+            self.tiles_per_frame = match total_tiles {
+                0..=16 => total_tiles,        // Render all at once for small images
+                17..=64 => total_tiles / 2,   // 2 batches for medium images  
+                65..=256 => 64,               // More aggressive for larger images
+                257..=1024 => 128,            // Even more aggressive for very large images
+                _ => 256,                     // Maximum parallelism for huge images
+            }.max(1); // Ensure at least 1 tile per frame
 
             // Recreate raytraced texture
             self.raytraced_texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -421,7 +445,8 @@ impl State {
             self.progressive_start_time = std::time::Instant::now();
             self.needs_recompute = false;
             
-            println!("Starting progressive render: {}x{} tiles", self.tiles_x, self.tiles_y);
+            println!("Starting parallel progressive render: {}x{} tiles, {} tiles per frame", 
+                     self.tiles_x, self.tiles_y, self.tiles_per_frame);
         }
         
         // Continue progressive rendering if in progress
@@ -440,54 +465,61 @@ impl State {
 
         let compute_start = std::time::Instant::now();
         
-        // Calculate current tile position
-        let tile_x = self.current_tile % self.tiles_x;
-        let tile_y = self.current_tile / self.tiles_x;
-        
-        let tile_offset_x = tile_x * self.tile_size;
-        let tile_offset_y = tile_y * self.tile_size;
-        
-        // Calculate actual tile size (handle edge tiles)
-        let actual_tile_width = std::cmp::min(self.tile_size, self.size.width - tile_offset_x);
-        let actual_tile_height = std::cmp::min(self.tile_size, self.size.height - tile_offset_y);
+        // Calculate how many tiles to process this frame
+        let tiles_remaining = total_tiles - self.current_tile;
+        let tiles_this_frame = std::cmp::min(self.tiles_per_frame, tiles_remaining);
         
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
+                label: Some("Parallel Compute Encoder"),
             });
+        
+        // Update spheres buffer once for all tiles
+        self.queue.write_buffer(
+            &self.spheres_buffer,
+            0,
+            bytemuck::cast_slice(&self.spheres),
+        );
         
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
+                label: Some("Parallel Compute Pass"),
             });
 
             compute_pass.set_pipeline(&self.compute_pipeline);
             compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
 
-            // Update spheres buffer if needed
-            self.queue.write_buffer(
-                &self.spheres_buffer,
-                0,
-                bytemuck::cast_slice(&self.spheres),
-            );
+            // Process multiple tiles in parallel
+            for i in 0..tiles_this_frame {
+                let tile_index = self.current_tile + i;
+                let tile_x = tile_index % self.tiles_x;
+                let tile_y = tile_index / self.tiles_x;
+                
+                let tile_offset_x = tile_x * self.tile_size;
+                let tile_offset_y = tile_y * self.tile_size;
+                
+                // Calculate actual tile size (handle edge tiles)
+                let actual_tile_width = std::cmp::min(self.tile_size, self.size.width - tile_offset_x);
+                let actual_tile_height = std::cmp::min(self.tile_size, self.size.height - tile_offset_y);
+                
+                let push_constants = PushConstants {
+                    resolution: [self.size.width as f32, self.size.height as f32],
+                    time: self.start_time.elapsed().as_secs_f32(),
+                    camera: self.camera,
+                    sphere_count: self.spheres.len() as u32,
+                    tile_offset: [tile_offset_x, tile_offset_y],
+                    tile_size: [actual_tile_width, actual_tile_height],
+                    total_tiles: [self.tiles_x, self.tiles_y],
+                    current_tile_index: tile_index,
+                };
+                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 
-            let push_constants = PushConstants {
-                resolution: [self.size.width as f32, self.size.height as f32],
-                time: self.start_time.elapsed().as_secs_f32(),
-                camera: self.camera,
-                sphere_count: self.spheres.len() as u32,
-                tile_offset: [tile_offset_x, tile_offset_y],
-                tile_size: [actual_tile_width, actual_tile_height],
-                total_tiles: [self.tiles_x, self.tiles_y],
-                current_tile_index: self.current_tile,
-            };
-            compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
-
-            // Dispatch workgroups for current tile
-            let workgroup_x = (actual_tile_width + 15) / 16;
-            let workgroup_y = (actual_tile_height + 15) / 16;
-            compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                // Dispatch workgroups for current tile
+                let workgroup_x = (actual_tile_width + 15) / 16;
+                let workgroup_y = (actual_tile_height + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -495,13 +527,14 @@ impl State {
         // Don't wait for GPU - allow frame to be displayed immediately
         self.last_compute_time = compute_start.elapsed();
         
-        // Move to next tile
-        self.current_tile += 1;
+        // Move to next set of tiles
+        self.current_tile += tiles_this_frame;
         
         // Progress feedback
-        if self.current_tile % 4 == 0 || self.current_tile == total_tiles {
+        if self.current_tile % self.tiles_per_frame == 0 || self.current_tile == total_tiles {
             let progress = (self.current_tile as f32 / total_tiles as f32) * 100.0;
-            println!("Progress: {:.1}% ({}/{})", progress, self.current_tile, total_tiles);
+            println!("Progress: {:.1}% ({}/{}) - {} tiles/frame", 
+                     progress, self.current_tile, total_tiles, tiles_this_frame);
         }
     }
 

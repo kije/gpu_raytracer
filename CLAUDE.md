@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a GPU-accelerated raytracer written in Rust using rust-gpu and WGPU for compute shaders. The project uses a workspace structure with two main components:
+This is a GPU-accelerated raytracer written in Rust using rust-gpu and WGPU for compute shaders. The project uses a workspace structure with three main components:
 
 - **Main application** (`src/main.rs`): WGPU-based application that sets up compute pipeline, manages window/surface, and handles the main event loop
 - **Compute shader** (`shader/`): SPIR-V compute shader written in Rust using rust-gpu's `spirv-std` for the actual raytracing calculations
+- **Shared crate** (`shared/`): Contains shared data structures used by both the main application and shader
 
 ## Build System
 
@@ -32,19 +33,23 @@ cargo run --release
 
 ## Architecture Changes (Latest)
 
-The project now uses a **decoupled compute/render architecture**:
+The project now uses a **progressive tile-based rendering architecture** with **shared data structures**:
 
+- **Progressive Rendering**: Raytracing uses 64x64 pixel tiles processed incrementally for real-time feedback
 - **Compute Phase**: Raytracing runs in compute shader, writes directly to storage texture
 - **Render Phase**: Fragment shader samples the raytraced texture onto a fullscreen quad
 - **Performance**: Raytracing only re-runs when needed (window resize, user input like spacebar)
 - **Scalability**: Complex raytracing won't block the render loop
+- **Shared Crate**: Common data structures eliminate code duplication between main app and shader
 
 ### Pipeline Structure
-1. **Compute Pipeline**: `main_cs` → Storage texture (rgba8)
+1. **Compute Pipeline**: `main_cs` → Storage texture (rgba8) via progressive tiles
 2. **Render Pipeline**: `main_vs` + `main_fs` → Screen framebuffer
 
 ### Controls
 - **Spacebar**: Trigger raytracer recomputation
+- **WASD**: Camera movement
+- **Mouse drag**: Camera rotation
 - **Resize**: Automatically triggers recomputation
 
 ## Architecture
@@ -55,23 +60,35 @@ The project now uses a **decoupled compute/render architecture**:
 - **Data flow**: Push constants (resolution, time) → Compute shader → Storage buffer → Surface texture
 
 ### Shader Interface
-- **Push constants**: `PushConstants` struct shared between host and shader for resolution/time data
-- **Storage buffer**: Vec4 array for pixel output from compute shader
-- **Binding**: Single storage buffer binding at descriptor set 0, binding 0
+- **Push constants**: `PushConstants` struct shared between host and shader for resolution/time/camera/tile data
+- **Storage texture**: Direct writes to rgba8 texture for progressive tile rendering
+- **Storage buffer**: Sphere data buffer for scene geometry
+- **Bindings**: 
+  - Descriptor set 0, binding 0: Storage texture (write)
+  - Descriptor set 0, binding 1: Spheres buffer (read)
+
+### Shared Data Structures (`shared/` crate)
+- **Camera**: Position, direction, up vector, FOV - uses `[f32; 3]` arrays for cross-platform compatibility
+- **Sphere**: Center, radius, color, material - scene geometry primitives
+- **PushConstants**: Resolution, time, camera, tile info - all shader parameters
+- **Cross-platform compatibility**: Uses arrays instead of Vec types, works in both std and no_std environments
 
 ### Key Dependencies
 - WGPU 0.16.0 with SPIR-V support for GPU compute
 - spirv-builder for shader compilation
+- raytracer-shared workspace crate for shared data structures
 - Specific dependency pinning for compatibility (ahash 0.7.8, gpu-descriptor 0.2.0)
 - glam for vector math
+- bytemuck for GPU data marshalling
 
 ## Shader Development
 
 The compute shader (`shader/src/lib.rs`) is a `#![no_std]` crate that:
 - Uses `spirv-std` for GPU programming primitives
-- Defines the main compute entry point as `main_cs`
-- Currently implements a simple test pattern (will be extended to raytracing)
-- Shares `PushConstants` struct with host application for parameter passing
+- Imports shared data structures from `raytracer-shared` crate
+- Implements progressive tile-based raytracing with sphere intersection
+- Converts array-based shared structs to Vec3 types for mathematical operations
+- Defines compute (`main_cs`), vertex (`main_vs`), and fragment (`main_fs`) shader entry points
 
 # Summary instructions
 

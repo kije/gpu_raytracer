@@ -18,7 +18,7 @@ pub fn main_cs(
     
     let width = push_constants.resolution[0] as u32;
     let height = push_constants.resolution[1] as u32;
-
+    
     // Check if we're outside the tile bounds or image bounds
     if id.x >= push_constants.tile_size[0] || 
        id.y >= push_constants.tile_size[1] ||
@@ -100,19 +100,51 @@ pub fn main_cs(
         }
     }
     
-    // Add tile visualization - subtle border for debugging
-    let tile_progress = push_constants.current_tile_index as f32 / 
-                       (push_constants.total_tiles[0] * push_constants.total_tiles[1]) as f32;
-    
-    // Add a subtle color tint based on tile progress for visual feedback
-    let progress_tint = vec3(0.1 * tile_progress, 0.05, 0.1 * (1.0 - tile_progress));
-    color = color + progress_tint * 0.2;
-
     let final_color = vec4(color.x, color.y, color.z, 1.0);
-
+    
     unsafe {
         output_image.write(UVec2::new(pixel_x, pixel_y), final_color);
     }
+    // Calculate global pixel coordinates from tile offset and local thread id
+    // let pixel_x = push_constants.tile_offset[0] + id.x;
+    // let pixel_y = push_constants.tile_offset[1] + id.y;
+    // 
+    // let width = push_constants.resolution[0] as u32;
+    // let height = push_constants.resolution[1] as u32;
+    // 
+    // // Check if we're outside the tile bounds or image bounds
+    // if id.x >= push_constants.tile_size[0] || 
+    //    id.y >= push_constants.tile_size[1] ||
+    //    pixel_x >= width || 
+    //    pixel_y >= height {
+    //     return;
+    // }
+    // 
+    // 
+    // 
+    // // Convert screen coordinates to camera ray
+    // let uv = vec2(
+    //     (pixel_x as f32 + 0.5) / width as f32,
+    //     (pixel_y as f32 + 0.5) / height as f32
+    // );
+    // 
+    // // For now, still output a gradient but incorporate sphere count
+    // let sphere_factor = if push_constants.sphere_count > 0 {
+    //     push_constants.sphere_count as f32 / 10.0
+    // } else {
+    //     1.0
+    // };
+    // 
+    // let color = vec4(
+    //     uv.x * sphere_factor,
+    //     uv.y,
+    //     0.5 + 0.3 * Float::sin(push_constants.time * 0.5),
+    //     1.0
+    // );
+    // 
+    // unsafe {
+    //     output_image.write(UVec2::new(pixel_x, pixel_y), color);
+    // }
 }
 
 fn normalize(v: Vec3) -> Vec3 {
@@ -124,8 +156,9 @@ fn normalize(v: Vec3) -> Vec3 {
     }
 }
 
+#[inline(always)]
 fn dot(a: Vec3, b: Vec3) -> f32 {
-    a.x * b.x + a.y * b.y + a.z * b.z
+    a.dot(b)
 }
 
 
