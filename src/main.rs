@@ -7,7 +7,10 @@ use winit::{
 };
 use bytemuck;
 use wgpu::{TextureUsages, util::make_spirv};
-use raytracer_shared::{Camera, Sphere, Triangle, Material, PushConstants, RaytracerConfig, TileHelper, SceneBuilder};
+use raytracer_shared::{Camera, Sphere, Triangle, Material, Light, TextureInfo, PushConstants, RaytracerConfig, TileHelper, SceneBuilder};
+
+mod gltf_loader;
+use gltf_loader::{GltfLoader, GltfError, LoadedScene};
 
 /// GPU resources and rendering pipelines
 struct RenderState {
@@ -35,12 +38,21 @@ struct BufferManager {
     spheres_buffer: wgpu::Buffer,
     triangles_buffer: wgpu::Buffer,
     materials_buffer: wgpu::Buffer,
+    lights_buffer: wgpu::Buffer,
+    textures_buffer: wgpu::Buffer,
+    texture_data_buffer: wgpu::Buffer,
     spheres_capacity: usize,
     triangles_capacity: usize,
     materials_capacity: usize,
+    lights_capacity: usize,
+    textures_capacity: usize,
+    texture_data_capacity: usize,
     spheres_dirty: bool,
     triangles_dirty: bool,
     materials_dirty: bool,
+    lights_dirty: bool,
+    textures_dirty: bool,
+    texture_data_dirty: bool,
 }
 
 /// Scene geometry and camera
@@ -49,6 +61,9 @@ struct SceneState {
     spheres: Vec<Sphere>,
     triangles: Vec<Triangle>,
     materials: Vec<Material>,
+    lights: Vec<Light>,
+    textures: Vec<TextureInfo>,
+    texture_data: Vec<u8>,
 }
 
 /// Progressive tile rendering state
@@ -208,6 +223,36 @@ impl RenderState {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -322,6 +367,18 @@ impl RenderState {
                     binding: 3,
                     resource: dummy_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -363,6 +420,9 @@ impl BufferManager {
         let spheres_capacity = RaytracerConfig::DEFAULT_MAX_SPHERES;
         let triangles_capacity = RaytracerConfig::DEFAULT_MAX_TRIANGLES;
         let materials_capacity = 64; // Default materials capacity
+        let lights_capacity = 32; // Default lights capacity
+        let textures_capacity = 64; // Default textures capacity
+        let texture_data_capacity = 256 * 1024; // 1MB default texture data capacity (in u32 units)
 
         let spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Spheres Buffer"),
@@ -384,17 +444,47 @@ impl BufferManager {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        
+        let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lights Buffer"),
+            size: (std::mem::size_of::<Light>() * lights_capacity) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        let textures_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Textures Buffer"),
+            size: (std::mem::size_of::<TextureInfo>() * textures_capacity) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        let texture_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Texture Data Buffer"),
+            size: (texture_data_capacity * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             spheres_buffer,
             triangles_buffer,
             materials_buffer,
+            lights_buffer,
+            textures_buffer,
+            texture_data_buffer,
             spheres_capacity,
             triangles_capacity,
             materials_capacity,
+            lights_capacity,
+            textures_capacity,
+            texture_data_capacity,
             spheres_dirty: true,
             triangles_dirty: true,
             materials_dirty: true,
+            lights_dirty: true,
+            textures_dirty: true,
+            texture_data_dirty: true,
         }
     }
 
@@ -503,9 +593,125 @@ impl BufferManager {
         self.materials_dirty = true;
     }
 
+    /// Update lights buffer with new data, resizing if necessary
+    fn update_lights(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lights: &[Light]) -> bool {
+        let needs_resize = lights.len() > self.lights_capacity;
+        
+        if needs_resize {
+            // Double the capacity to accommodate growth
+            self.lights_capacity = (lights.len() * 2).max(32);
+            
+            self.lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Lights Buffer"),
+                size: (std::mem::size_of::<Light>() * self.lights_capacity) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            println!("Resized lights buffer to capacity: {}", self.lights_capacity);
+        }
+        
+        if self.lights_dirty || needs_resize {
+            queue.write_buffer(
+                &self.lights_buffer,
+                0,
+                bytemuck::cast_slice(lights),
+            );
+            self.lights_dirty = false;
+        }
+        
+        needs_resize
+    }
+
+    /// Update textures buffer with new data, resizing if necessary
+    fn update_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, textures: &[TextureInfo]) -> bool {
+        let needs_resize = textures.len() > self.textures_capacity;
+        
+        if needs_resize {
+            // Double the capacity to accommodate growth
+            self.textures_capacity = (textures.len() * 2).max(64);
+            
+            self.textures_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Textures Buffer"),
+                size: (std::mem::size_of::<TextureInfo>() * self.textures_capacity) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            println!("Resized textures buffer to capacity: {}", self.textures_capacity);
+        }
+        
+        if self.textures_dirty || needs_resize {
+            queue.write_buffer(
+                &self.textures_buffer,
+                0,
+                bytemuck::cast_slice(textures),
+            );
+            self.textures_dirty = false;
+        }
+        
+        needs_resize
+    }
+
+    /// Update texture data buffer with new data, resizing if necessary
+    fn update_texture_data(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_data: &[u8]) -> bool {
+        // Pack u8 data into u32 for GPU compatibility (4 bytes per u32)
+        let mut packed_data = Vec::new();
+        for chunk in texture_data.chunks(4) {
+            let mut packed: u32 = 0;
+            for (i, &byte) in chunk.iter().enumerate() {
+                packed |= (byte as u32) << (i * 8);
+            }
+            packed_data.push(packed);
+        }
+        
+        let needs_resize = packed_data.len() > self.texture_data_capacity;
+        
+        if needs_resize {
+            // Double the capacity to accommodate growth (capacity is in u32 units)
+            self.texture_data_capacity = (packed_data.len() * 2).max(256 * 1024); // 1MB in u32 units
+            
+            self.texture_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Texture Data Buffer"),
+                size: (self.texture_data_capacity * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            println!("Resized texture data buffer to capacity: {} u32s", self.texture_data_capacity);
+        }
+        
+        if self.texture_data_dirty || needs_resize {
+            queue.write_buffer(
+                &self.texture_data_buffer,
+                0,
+                bytemuck::cast_slice(&packed_data),
+            );
+            self.texture_data_dirty = false;
+        }
+        
+        needs_resize
+    }
+
+    /// Mark lights buffer as dirty (needs update)
+    fn mark_lights_dirty(&mut self) {
+        self.lights_dirty = true;
+    }
+
+    /// Mark textures buffer as dirty (needs update)
+    fn mark_textures_dirty(&mut self) {
+        self.textures_dirty = true;
+    }
+
+    /// Mark texture data buffer as dirty (needs update)
+    fn mark_texture_data_dirty(&mut self) {
+        self.texture_data_dirty = true;
+    }
+
     /// Check if any buffers need updating
     fn needs_update(&self) -> bool {
-        self.spheres_dirty || self.triangles_dirty || self.materials_dirty
+        self.spheres_dirty || self.triangles_dirty || self.materials_dirty || 
+        self.lights_dirty || self.textures_dirty || self.texture_data_dirty
     }
 }
 
@@ -518,7 +724,70 @@ impl SceneState {
             spheres,
             triangles,
             materials,
+            lights: Vec::new(),
+            textures: Vec::new(),
+            texture_data: Vec::new(),
         }
+    }
+
+    /// Load scene from glTF file
+    fn load_from_gltf<P: AsRef<std::path::Path>>(path: P) -> Result<Self, GltfError> {
+        let loader = GltfLoader::load_from_path(&path)?;
+        let loaded_scene = loader.extract_scene(None)?;
+        
+        // Use the first camera from glTF if available, otherwise default camera
+        let camera = loaded_scene.cameras.first().copied().unwrap_or_else(Camera::new);
+        
+        Ok(Self {
+            camera,
+            spheres: loaded_scene.spheres,
+            triangles: loaded_scene.triangles,
+            materials: loaded_scene.materials,
+            lights: loaded_scene.lights,
+            textures: loaded_scene.textures,
+            texture_data: loaded_scene.texture_data,
+        })
+    }
+
+    /// Load scene from glTF file with fallback to default scene
+    fn load_from_gltf_or_default<P: AsRef<std::path::Path>>(path: P) -> Self {
+        match Self::load_from_gltf(path.as_ref()) {
+            Ok(scene) => {
+                println!("Successfully loaded glTF scene from: {:?}", path.as_ref());
+                scene
+            }
+            Err(e) => {
+                println!("Failed to load glTF scene from {:?}, using default scene. Error: {:?}", 
+                         path.as_ref(), e);
+                Self::new()
+            }
+        }
+    }
+
+    /// Replace current scene with glTF data
+    fn replace_with_gltf<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<(), GltfError> {
+        let loader = GltfLoader::load_from_path(&path)?;
+        let loaded_scene = loader.extract_scene(None)?;
+        
+        // Use the first camera from glTF if available, otherwise keep current camera
+        if let Some(new_camera) = loaded_scene.cameras.first() {
+            self.camera = *new_camera;
+            println!("Loaded camera from glTF: pos={:?}, dir={:?}, fov={}", 
+                     self.camera.position, self.camera.direction, self.camera.fov);
+        }
+        
+        self.spheres = loaded_scene.spheres;
+        self.triangles = loaded_scene.triangles;
+        self.materials = loaded_scene.materials;
+        self.lights = loaded_scene.lights;
+        self.textures = loaded_scene.textures;
+        self.texture_data = loaded_scene.texture_data;
+        
+        println!("Loaded glTF scene: {} spheres, {} triangles, {} materials, {} lights, {} textures",
+                 self.spheres.len(), self.triangles.len(), self.materials.len(),
+                 self.lights.len(), self.textures.len());
+        
+        Ok(())
     }
 }
 
@@ -615,6 +884,18 @@ impl State {
                     binding: 3,
                     resource: buffers.materials_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buffers.lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: buffers.texture_data_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -693,6 +974,18 @@ impl State {
                     binding: 3,
                     resource: self.buffers.materials_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.buffers.lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.buffers.texture_data_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -758,9 +1051,12 @@ impl State {
         let spheres_resized = self.buffers.update_spheres(&self.render.device, &self.render.queue, &self.scene.spheres);
         let triangles_resized = self.buffers.update_triangles(&self.render.device, &self.render.queue, &self.scene.triangles);
         let materials_resized = self.buffers.update_materials(&self.render.device, &self.render.queue, &self.scene.materials);
+        let lights_resized = self.buffers.update_lights(&self.render.device, &self.render.queue, &self.scene.lights);
+        let textures_resized = self.buffers.update_textures(&self.render.device, &self.render.queue, &self.scene.textures);
+        let texture_data_resized = self.buffers.update_texture_data(&self.render.device, &self.render.queue, &self.scene.texture_data);
         
         // If buffers were resized, recreate bind groups with new buffers
-        if spheres_resized || triangles_resized || materials_resized {
+        if spheres_resized || triangles_resized || materials_resized || lights_resized || textures_resized || texture_data_resized {
             self.recreate_bind_groups();
         }
         
@@ -792,10 +1088,10 @@ impl State {
                     self.scene.spheres.len() as u32,
                     self.scene.triangles.len() as u32,
                     self.scene.materials.len() as u32,
+                    self.scene.lights.len() as u32,
                     [tile_offset_x, tile_offset_y],
                     [actual_tile_width, actual_tile_height],
                     [self.progressive.tiles_x, self.progressive.tiles_y],
-                    tile_index,
                 );
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 
@@ -989,6 +1285,20 @@ async fn run() {
                         }
                         VirtualKeyCode::D => {
                             state.move_camera(0.0, 1.0);
+                        }
+                        VirtualKeyCode::L => {
+                            // Try to load a glTF file (example usage)
+                            if let Err(e) = state.scene.replace_with_gltf("model.gltf") {
+                                println!("Failed to load glTF file: {:?}", e);
+                            } else {
+                                state.progressive.needs_recompute = true;
+                                state.buffers.mark_spheres_dirty();
+                                state.buffers.mark_triangles_dirty();
+                                state.buffers.mark_materials_dirty();
+                                state.buffers.mark_lights_dirty();
+                                state.buffers.mark_textures_dirty();
+                                state.buffers.mark_texture_data_dirty();
+                            }
                         }
                         VirtualKeyCode::Escape => {
                             control_flow.set_exit();

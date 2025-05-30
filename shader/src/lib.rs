@@ -3,7 +3,7 @@
 use spirv_std::spirv;
 use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec3, Vec4, UVec2};
 use spirv_std::num_traits::Float;
-use raytracer_shared::{Sphere, Triangle, Material, PushConstants, RaytracerConfig};
+use raytracer_shared::{Sphere, Triangle, Material, Light, TextureInfo, PushConstants, RaytracerConfig};
 
 #[spirv(compute(threads(16, 16)))]
 pub fn main_cs(
@@ -12,6 +12,9 @@ pub fn main_cs(
     #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] spheres: &[Sphere],
     #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] triangles: &[Triangle],
     #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] materials: &[Material],
+    #[spirv(descriptor_set = 0, binding = 4, storage_buffer)] lights: &[Light],
+    #[spirv(descriptor_set = 0, binding = 5, storage_buffer)] textures: &[TextureInfo],
+    #[spirv(descriptor_set = 0, binding = 6, storage_buffer)] texture_data: &[u32],
     #[spirv(push_constant)] push_constants: &PushConstants,
 ) {
     // Calculate global pixel coordinates from tile offset and local thread id
@@ -53,7 +56,7 @@ pub fn main_cs(
     let ray_direction_normalized = ray_direction.normalize();
     
     // Raytracing - find closest intersection (spheres and triangles)
-    let mut color = vec3(0.2, 0.2, 0.3); // Sky color
+    let mut color = vec3(0.0, 0.0, 0.0); // Sky color
     let mut closest_t = f32::INFINITY;
     let mut hit_material_id: u32 = 0;
     let mut hit_normal = vec3(0.0, 0.0, 0.0);
@@ -146,26 +149,73 @@ pub fn main_cs(
             let albedo = vec3(material.albedo[0], material.albedo[1], material.albedo[2]);
             let emission = vec3(material.emission[0], material.emission[1], material.emission[2]);
             
-            // Simple PBR-like lighting (placeholder for Microfacet BRDF)
-            let light_dir = vec3(0.577, 0.577, 0.577); // Normalized (1,1,1)
+            // Calculate lighting from all scene lights
             let view_dir = -ray_direction_normalized;
-            let light_intensity = hit_normal.dot(light_dir).max(0.0);
+            let mut total_lighting = vec3(0.0, 0.0, 0.0);
             
-            // Simplified BRDF evaluation
-            let diffuse = albedo / core::f32::consts::PI;
+            // Ambient lighting
             let ambient = albedo * 0.1;
+            total_lighting += ambient;
             
-            // Handle metallic/dielectric workflow
-            let base_color = if material.metallic > 0.5 {
-                // Metallic: tint specular with albedo, no diffuse
-                albedo * light_intensity * 0.5
-            } else {
-                // Dielectric: diffuse + fresnel specular
-                diffuse * light_intensity + ambient
-            };
+            // Process all lights in the scene
+            for light_idx in 0..push_constants.lights_count {
+                if light_idx >= lights.len() as u32 {
+                    break;
+                }
+
+                
+                let light = lights[light_idx as usize];
+                let light_pos = vec3(light.position[0], light.position[1], light.position[2]);
+                let light_dir_vec = vec3(light.direction[0], light.direction[1], light.direction[2]);
+                let light_color = vec3(light.color[0], light.color[1], light.color[2]);
+                
+                let mut light_dir = vec3(0.0, 0.0, 0.0);
+                let mut light_intensity = 0.0;
+                
+                // Handle different light types (directional=0, point=1, spot=2)
+                if light.light_type == 0 {
+                    // Directional light
+                    light_dir = -light_dir_vec.normalize();
+                    light_intensity = hit_normal.dot(light_dir).max(0.0) * light.intensity;
+                } else if light.light_type == 1 {
+                    // Point light
+                    let to_light = light_pos - hit_point;
+                    let distance = to_light.length();
+                    light_dir = to_light.normalize();
+                    
+                    // Inverse square falloff
+                    let attenuation = 1.0 / (1.0 + distance * distance * 0.01);
+                    light_intensity = hit_normal.dot(light_dir).max(0.0) * light.intensity * attenuation;
+                } else if light.light_type == 2 {
+                    // Spot light (simplified)
+                    let to_light = light_pos - hit_point;
+                    let distance = to_light.length();
+                    light_dir = to_light.normalize();
+                    
+                    let spot_factor = (-light_dir_vec.normalize()).dot(light_dir).max(0.0);
+                    let attenuation = 1.0 / (1.0 + distance * distance * 0.01);
+                    light_intensity = hit_normal.dot(light_dir).max(0.0) * light.intensity * attenuation * spot_factor;
+                }
+                
+                if light_intensity > 0.0 {
+                    // Simplified BRDF evaluation
+                    let diffuse = albedo / core::f32::consts::PI;
+                    
+                    // Handle metallic/dielectric workflow
+                    let light_contribution = if material.metallic > 0.5 {
+                        // Metallic: tint specular with albedo, no diffuse
+                        albedo * light_intensity * 0.5
+                    } else {
+                        // Dielectric: diffuse contribution
+                        diffuse * light_intensity
+                    };
+                    
+                    total_lighting += light_contribution * light_color;
+                }
+            }
             
             // Add emission
-            color = base_color + emission;
+            color = total_lighting + emission;
             
             // Handle transmission (simplified)
             if material.transmission > 0.0 {

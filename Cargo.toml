@@ -8,7 +8,7 @@ wgpu = { version = "=0.16.0", features = ["spirv", "vulkan-portability"] }
 winit = "0.28.3"
 pollster = "0.4"
 bytemuck = { version = "1.19", features = ["derive"] }
-glam = "0.29"
+glam = { version = "0.29", features = ["std"] }
 env_logger = "0.11"
 libm = "=0.2.10"
 ahash = "=0.7.8"
@@ -16,6 +16,19 @@ wgpu-core = "=0.16.0"
 wgpu-hal = "=0.16.0"
 gpu-descriptor = "=0.2.0"
 raytracer-shared = { path = "shared" }
+gltf = { version = "1.4", features = [
+    "KHR_materials_transmission", 
+    "KHR_materials_ior", 
+    "KHR_materials_specular",
+    "KHR_materials_volume",
+    "KHR_materials_pbrSpecularGlossiness",
+    "KHR_lights_punctual",
+    "extras", 
+    "names"
+] }
+image = "0.24"
+exr = { version = "=1.5.0" }
+half = { version = "=1.8.3" }
 
 [build-dependencies]
 spirv-builder = { version = "0.9", features = ["watch", "use-installed-tools"], default-features = false }

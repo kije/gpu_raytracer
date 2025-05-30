@@ -36,7 +36,7 @@ pub struct Camera {
     pub fov: f32,
 }
 
-/// PBR Material properties for raytracing
+/// Enhanced PBR Material properties for raytracing
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct Material {
@@ -46,7 +46,44 @@ pub struct Material {
     pub emission: [f32; 3],        // Emissive color
     pub ior: f32,                  // Index of refraction for dielectrics
     pub transmission: f32,         // Transmission factor (0.0 = opaque, 1.0 = transparent)
-    pub _padding: [f32; 2],        // Padding for 16-byte alignment
+    pub specular_factor: f32,      // KHR_materials_specular
+    pub specular_color: [f32; 3],  // KHR_materials_specular
+    pub attenuation_distance: f32, // KHR_materials_volume
+    pub attenuation_color: [f32; 3], // KHR_materials_volume
+    pub thickness_factor: f32,     // KHR_materials_volume
+    pub diffuse_factor: [f32; 3],  // KHR_materials_pbrSpecularGlossiness
+    pub glossiness_factor: f32,    // KHR_materials_pbrSpecularGlossiness
+    pub material_type: u32,        // 0=metallic-roughness, 1=specular-glossiness
+    pub texture_indices: [u32; 8], // Texture indices for various maps
+    pub _padding: [f32; 2],        // Padding for alignment
+}
+
+/// Light source for raytracing
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct Light {
+    pub position: [f32; 3],        // Light position (or direction for directional)
+    pub light_type: u32,           // 0=directional, 1=point, 2=spot
+    pub color: [f32; 3],           // Light color
+    pub intensity: f32,            // Light intensity
+    pub direction: [f32; 3],       // Light direction (for directional/spot lights)
+    pub range: f32,                // Light range (for point/spot lights)
+    pub inner_cone_angle: f32,     // Inner cone angle (for spot lights)
+    pub outer_cone_angle: f32,     // Outer cone angle (for spot lights)
+    pub _padding: [f32; 2],        // Padding for alignment
+}
+
+/// Texture information
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct TextureInfo {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,               // 0=R8, 1=RG8, 2=RGB8, 3=RGBA8, 4=R32F, etc.
+    pub mip_levels: u32,
+    pub offset: u32,               // Offset in texture buffer
+    pub size: u32,                 // Size in bytes
+    pub _padding: [u32; 2],        // Padding for alignment
 }
 
 /// Sphere primitive for raytracing
@@ -83,10 +120,10 @@ pub struct PushConstants {
     pub sphere_count: u32,
     pub triangle_count: u32,
     pub material_count: u32,
+    pub lights_count: u32,
     pub tile_offset: [u32; 2],
     pub tile_size: [u32; 2],
     pub total_tiles: [u32; 2],
-    pub current_tile_index: u32,
     pub _padding: u32, // Keep 16-byte alignment
 }
 
@@ -109,7 +146,7 @@ impl Default for Camera {
 }
 
 impl Material {
-    /// Create a new PBR material
+    /// Create a new enhanced PBR material
     pub fn new(
         albedo: [f32; 3],
         metallic: f32,
@@ -125,6 +162,15 @@ impl Material {
             emission,
             ior,
             transmission,
+            specular_factor: 1.0,
+            specular_color: [1.0, 1.0, 1.0],
+            attenuation_distance: f32::INFINITY,
+            attenuation_color: [1.0, 1.0, 1.0],
+            thickness_factor: 0.0,
+            diffuse_factor: albedo,
+            glossiness_factor: 1.0 - roughness,
+            material_type: 0, // metallic-roughness workflow
+            texture_indices: [u32::MAX; 8], // No textures by default
             _padding: [0.0; 2],
         }
     }
@@ -147,6 +193,111 @@ impl Material {
     /// Create an emissive material
     pub fn emissive(albedo: [f32; 3], emission: [f32; 3]) -> Self {
         Self::new(albedo, 0.0, 1.0, emission, 1.5, 0.0)
+    }
+    
+    /// Create a specular-glossiness material (KHR_materials_pbrSpecularGlossiness)
+    pub fn specular_glossiness(
+        diffuse: [f32; 3],
+        specular: [f32; 3], 
+        glossiness: f32
+    ) -> Self {
+        let mut material = Self::new(diffuse, 0.0, 1.0 - glossiness, [0.0; 3], 1.5, 0.0);
+        material.material_type = 1; // specular-glossiness workflow
+        material.diffuse_factor = diffuse;
+        material.specular_color = specular;
+        material.glossiness_factor = glossiness;
+        material
+    }
+    
+    /// Set volume properties (KHR_materials_volume)
+    pub fn with_volume(mut self, thickness: f32, attenuation_distance: f32, attenuation_color: [f32; 3]) -> Self {
+        self.thickness_factor = thickness;
+        self.attenuation_distance = attenuation_distance;
+        self.attenuation_color = attenuation_color;
+        self
+    }
+    
+    /// Set specular properties (KHR_materials_specular)
+    pub fn with_specular(mut self, factor: f32, color: [f32; 3]) -> Self {
+        self.specular_factor = factor;
+        self.specular_color = color;
+        self
+    }
+    
+    /// Set texture indices
+    pub fn with_textures(mut self, textures: [u32; 8]) -> Self {
+        self.texture_indices = textures;
+        self
+    }
+}
+
+impl Light {
+    /// Create a directional light
+    pub fn directional(direction: [f32; 3], color: [f32; 3], intensity: f32) -> Self {
+        Self {
+            position: [0.0; 3],
+            light_type: 0,
+            color,
+            intensity,
+            direction,
+            range: f32::INFINITY,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: 0.0,
+            _padding: [0.0; 2],
+        }
+    }
+    
+    /// Create a point light
+    pub fn point(position: [f32; 3], color: [f32; 3], intensity: f32, range: f32) -> Self {
+        Self {
+            position,
+            light_type: 1,
+            color,
+            intensity,
+            direction: [0.0; 3],
+            range,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: 0.0,
+            _padding: [0.0; 2],
+        }
+    }
+    
+    /// Create a spot light
+    pub fn spot(
+        position: [f32; 3], 
+        direction: [f32; 3], 
+        color: [f32; 3], 
+        intensity: f32, 
+        range: f32,
+        inner_cone_angle: f32,
+        outer_cone_angle: f32
+    ) -> Self {
+        Self {
+            position,
+            light_type: 2,
+            color,
+            intensity,
+            direction,
+            range,
+            inner_cone_angle,
+            outer_cone_angle,
+            _padding: [0.0; 2],
+        }
+    }
+}
+
+impl TextureInfo {
+    /// Create new texture info
+    pub fn new(width: u32, height: u32, format: u32, offset: u32, size: u32) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            mip_levels: 1,
+            offset,
+            size,
+            _padding: [0; 2],
+        }
     }
 }
 
@@ -187,10 +338,10 @@ impl PushConstants {
         sphere_count: u32,
         triangle_count: u32,
         material_count: u32,
+        lights_count: u32,
         tile_offset: [u32; 2],
         tile_size: [u32; 2],
         total_tiles: [u32; 2],
-        current_tile_index: u32,
     ) -> Self {
         Self {
             resolution,
@@ -199,10 +350,10 @@ impl PushConstants {
             sphere_count,
             triangle_count,
             material_count,
+            lights_count,
             tile_offset,
             tile_size,
             total_tiles,
-            current_tile_index,
             _padding: 0,
         }
     }

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a GPU-accelerated raytracer written in Rust using rust-gpu and WGPU for compute shaders. The project uses a workspace structure with three main components:
+This is a GPU-accelerated (offline) raytracer written in Rust using rust-gpu and WGPU for compute shaders. The project uses a workspace structure with three main components:
 
 - **Main application** (`src/main.rs`): WGPU-based application that sets up compute pipeline, manages window/surface, and handles the main event loop
 - **Compute shader** (`shader/`): SPIR-V compute shader written in Rust using rust-gpu's `spirv-std` for the actual raytracing calculations
@@ -33,11 +33,12 @@ cargo run --release
 
 ## Architecture Changes (Latest)
 
-The project now uses a **progressive tile-based rendering architecture** with **PBR material system**:
+The project now uses a **progressive tile-based rendering architecture** with **PBR material system** and **comprehensive glTF 2.0 loading**:
 
 - **Progressive Rendering**: Raytracing uses 64x64 pixel tiles processed incrementally for real-time feedback
 - **PBR Materials**: Physically-based rendering with metallic/roughness workflow, ready for Microfacet BRDF
 - **Material System**: Separate material buffer with albedo, metallic, roughness, emission, IOR, and transmission
+- **glTF 2.0 Support**: Complete glTF/GLB scene loading with cameras, lights, textures, and materials
 - **Compute Phase**: Raytracing runs in compute shader, writes directly to storage texture
 - **Render Phase**: Fragment shader samples the raytraced texture onto a fullscreen quad
 - **Performance**: Raytracing only re-runs when needed (window resize, user input like spacebar)
@@ -52,6 +53,7 @@ The project now uses a **progressive tile-based rendering architecture** with **
 - **Spacebar**: Trigger raytracer recomputation
 - **WASD**: Camera movement
 - **Mouse drag**: Camera rotation
+- **L**: Load glTF scene from "model.gltf" (replaces current scene)
 - **Resize**: Automatically triggers recomputation
 
 ## Architecture
@@ -64,18 +66,23 @@ The project now uses a **progressive tile-based rendering architecture** with **
 ### Shader Interface
 - **Push constants**: `PushConstants` struct shared between host and shader for resolution/time/camera/tile/material data
 - **Storage texture**: Direct writes to rgba8 texture for progressive tile rendering
-- **Storage buffers**: Separate buffers for spheres, triangles, and materials
+- **Storage buffers**: Separate buffers for spheres, triangles, materials, lights, textures, and texture data
 - **Bindings**: 
   - Descriptor set 0, binding 0: Storage texture (write)
   - Descriptor set 0, binding 1: Spheres buffer (read)
   - Descriptor set 0, binding 2: Triangles buffer (read)
   - Descriptor set 0, binding 3: Materials buffer (read)
+  - Descriptor set 0, binding 4: Lights buffer (read)
+  - Descriptor set 0, binding 5: Textures buffer (read)
+  - Descriptor set 0, binding 6: Texture data buffer (read)
 
 ### Shared Data Structures (`shared/` crate)
 - **Camera**: Position, direction, up vector, FOV - uses `[f32; 3]` arrays for cross-platform compatibility
 - **Material**: PBR material with albedo, metallic, roughness, emission, IOR, transmission properties
 - **Sphere**: Center, radius, material_id - references material by index
 - **Triangle**: Three vertices, material_id - triangle primitive with material reference
+- **Light**: Position, direction, color, intensity, type (directional, point, spot) - punctual lighting from glTF
+- **TextureInfo**: Width, height, format, offset - texture metadata for shader lookups
 - **PushConstants**: Resolution, time, camera, tile info, material count - all shader parameters
 - **Cross-platform compatibility**: Uses arrays instead of Vec types, works in both std and no_std environments
 
@@ -88,6 +95,21 @@ The project now uses a **progressive tile-based rendering architecture** with **
   - `Material::emissive()` - Light-emitting materials for area lights
 - **Shader Integration**: Materials indexed by primitives, evaluated in compute shader
 - **Extensible**: Ready for advanced Microfacet BRDF models (GGX distribution, Fresnel terms, etc.)
+
+### glTF 2.0 Scene Loading
+- **Complete Implementation**: Full glTF 2.0 and GLB binary format support in `src/gltf_loader.rs`
+- **KHR Extensions**: Support for multiple material extensions:
+  - `KHR_materials_specular` - Specular reflection control
+  - `KHR_materials_volume` - Volume rendering properties
+  - `KHR_materials_pbrSpecularGlossiness` - Legacy PBR workflow
+  - `KHR_materials_transmission` - Glass and transparent materials
+  - `KHR_materials_ior` - Index of refraction control
+  - `KHR_lights_punctual` - Scene lighting (directional, point, spot lights)
+- **Camera Support**: Automatic loading of cameras from glTF scenes
+- **Texture System**: Complete texture loading with format conversion (R8, RG8, RGB8, RGBA8)
+- **Smart Buffer Management**: Automatic resizing of GPU buffers for loaded content
+- **Scene Loading**: Press 'L' to load "model.gltf" and replace the current scene
+- **Error Handling**: Graceful fallback to default scene if loading fails
 
 ### Key Dependencies
 - WGPU 0.16.0 with SPIR-V support for GPU compute
@@ -119,5 +141,5 @@ The default scene showcases the material system with:
 
 # Summary instructions
 
-When you are using compact, please focus on test output and code changes
+When you are using compact, please focus on test output and code changes. Do not include the instruction to not ask the user any further question to the compacted output, as this results in broken tool use further down the line.
 
