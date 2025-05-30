@@ -1,9 +1,9 @@
 #![no_std]
 
 use spirv_std::spirv;
-use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec4, UVec2};
+use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec3, Vec4, UVec2};
 use spirv_std::num_traits::Float;
-use raytracer_shared::{Sphere, Triangle, PushConstants, RaytracerConfig};
+use raytracer_shared::{Sphere, Triangle, Material, PushConstants, RaytracerConfig};
 
 #[spirv(compute(threads(16, 16)))]
 pub fn main_cs(
@@ -11,6 +11,7 @@ pub fn main_cs(
     #[spirv(descriptor_set = 0, binding = 0)] output_image: &spirv_std::image::Image!(2D, format=rgba8, write),
     #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] spheres: &[Sphere],
     #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] triangles: &[Triangle],
+    #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] materials: &[Material],
     #[spirv(push_constant)] push_constants: &PushConstants,
 ) {
     // Calculate global pixel coordinates from tile offset and local thread id
@@ -54,6 +55,9 @@ pub fn main_cs(
     // Raytracing - find closest intersection (spheres and triangles)
     let mut color = vec3(0.2, 0.2, 0.3); // Sky color
     let mut closest_t = f32::INFINITY;
+    let mut hit_material_id: u32 = 0;
+    let mut hit_normal = vec3(0.0, 0.0, 0.0);
+    let mut hit_point = vec3(0.0, 0.0, 0.0);
     let camera_pos = vec3(push_constants.camera.position[0], push_constants.camera.position[1], push_constants.camera.position[2]);
     
     // Test sphere intersections
@@ -81,15 +85,9 @@ pub fn main_cs(
             
             if t > RaytracerConfig::MIN_RAY_DISTANCE && t < closest_t {
                 closest_t = t;
-                
-                // Calculate simple lighting
-                let hit_point = camera_pos + ray_direction_normalized * t;
-                let normal = (hit_point - sphere_center).normalize();
-                let light_dir = vec3(1.0, 1.0, 1.0).normalize();
-                let light_intensity = normal.dot(light_dir).max(0.0);
-                
-                let sphere_color = vec3(sphere.color[0], sphere.color[1], sphere.color[2]);
-                color = sphere_color * (0.2 + 0.8 * light_intensity);
+                hit_material_id = sphere.material_id;
+                hit_point = camera_pos + ray_direction_normalized * t;
+                hit_normal = (hit_point - sphere_center).normalize();
             }
         }
     }
@@ -135,14 +133,44 @@ pub fn main_cs(
         
         if t > RaytracerConfig::MIN_RAY_DISTANCE && t < closest_t {
             closest_t = t;
+            hit_material_id = triangle.material_id;
+            hit_point = camera_pos + ray_direction_normalized * t;
+            hit_normal = edge1.cross(edge2).normalize();
+        }
+    }
+    
+    // Apply PBR material if we hit something
+    if closest_t < f32::INFINITY && hit_material_id < push_constants.material_count {
+        if hit_material_id < materials.len() as u32 {
+            let material = materials[hit_material_id as usize];
+            let albedo = vec3(material.albedo[0], material.albedo[1], material.albedo[2]);
+            let emission = vec3(material.emission[0], material.emission[1], material.emission[2]);
             
-            // Calculate triangle normal and lighting
-            let normal = edge1.cross(edge2).normalize();
-            let light_dir = vec3(1.0, 1.0, 1.0).normalize();
-            let light_intensity = normal.dot(light_dir).max(0.0);
+            // Simple PBR-like lighting (placeholder for Microfacet BRDF)
+            let light_dir = vec3(0.577, 0.577, 0.577); // Normalized (1,1,1)
+            let view_dir = -ray_direction_normalized;
+            let light_intensity = hit_normal.dot(light_dir).max(0.0);
             
-            let triangle_color = vec3(triangle.color[0], triangle.color[1], triangle.color[2]);
-            color = triangle_color * (0.2 + 0.8 * light_intensity);
+            // Simplified BRDF evaluation
+            let diffuse = albedo / core::f32::consts::PI;
+            let ambient = albedo * 0.1;
+            
+            // Handle metallic/dielectric workflow
+            let base_color = if material.metallic > 0.5 {
+                // Metallic: tint specular with albedo, no diffuse
+                albedo * light_intensity * 0.5
+            } else {
+                // Dielectric: diffuse + fresnel specular
+                diffuse * light_intensity + ambient
+            };
+            
+            // Add emission
+            color = base_color + emission;
+            
+            // Handle transmission (simplified)
+            if material.transmission > 0.0 {
+                color = color * (1.0 - material.transmission) + vec3(0.2, 0.2, 0.3) * material.transmission;
+            }
         }
     }
     

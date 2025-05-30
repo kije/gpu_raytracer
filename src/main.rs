@@ -7,7 +7,7 @@ use winit::{
 };
 use bytemuck;
 use wgpu::{TextureUsages, util::make_spirv};
-use raytracer_shared::{Camera, Sphere, Triangle, PushConstants, RaytracerConfig, TileHelper, SceneBuilder};
+use raytracer_shared::{Camera, Sphere, Triangle, Material, PushConstants, RaytracerConfig, TileHelper, SceneBuilder};
 
 /// GPU resources and rendering pipelines
 struct RenderState {
@@ -34,10 +34,13 @@ struct RenderState {
 struct BufferManager {
     spheres_buffer: wgpu::Buffer,
     triangles_buffer: wgpu::Buffer,
+    materials_buffer: wgpu::Buffer,
     spheres_capacity: usize,
     triangles_capacity: usize,
+    materials_capacity: usize,
     spheres_dirty: bool,
     triangles_dirty: bool,
+    materials_dirty: bool,
 }
 
 /// Scene geometry and camera
@@ -45,6 +48,7 @@ struct SceneState {
     camera: Camera,
     spheres: Vec<Sphere>,
     triangles: Vec<Triangle>,
+    materials: Vec<Material>,
 }
 
 /// Progressive tile rendering state
@@ -194,6 +198,16 @@ impl RenderState {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -304,6 +318,10 @@ impl RenderState {
                     binding: 2,
                     resource: dummy_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -344,6 +362,7 @@ impl BufferManager {
     fn new(device: &wgpu::Device) -> Self {
         let spheres_capacity = RaytracerConfig::DEFAULT_MAX_SPHERES;
         let triangles_capacity = RaytracerConfig::DEFAULT_MAX_TRIANGLES;
+        let materials_capacity = 64; // Default materials capacity
 
         let spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Spheres Buffer"),
@@ -358,14 +377,24 @@ impl BufferManager {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        
+        let materials_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Materials Buffer"),
+            size: (std::mem::size_of::<Material>() * materials_capacity) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             spheres_buffer,
             triangles_buffer,
+            materials_buffer,
             spheres_capacity,
             triangles_capacity,
+            materials_capacity,
             spheres_dirty: true,
             triangles_dirty: true,
+            materials_dirty: true,
         }
     }
 
@@ -439,20 +468,56 @@ impl BufferManager {
         self.triangles_dirty = true;
     }
 
+    /// Update materials buffer with new data, resizing if necessary
+    fn update_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, materials: &[Material]) -> bool {
+        let needs_resize = materials.len() > self.materials_capacity;
+        
+        if needs_resize {
+            // Double the capacity to accommodate growth
+            self.materials_capacity = (materials.len() * 2).max(64);
+            
+            self.materials_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Materials Buffer"),
+                size: (std::mem::size_of::<Material>() * self.materials_capacity) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            println!("Resized materials buffer to capacity: {}", self.materials_capacity);
+        }
+        
+        if self.materials_dirty || needs_resize {
+            queue.write_buffer(
+                &self.materials_buffer,
+                0,
+                bytemuck::cast_slice(materials),
+            );
+            self.materials_dirty = false;
+        }
+        
+        needs_resize
+    }
+
+    /// Mark materials buffer as dirty (needs update)
+    fn mark_materials_dirty(&mut self) {
+        self.materials_dirty = true;
+    }
+
     /// Check if any buffers need updating
     fn needs_update(&self) -> bool {
-        self.spheres_dirty || self.triangles_dirty
+        self.spheres_dirty || self.triangles_dirty || self.materials_dirty
     }
 }
 
 impl SceneState {
     fn new() -> Self {
-        let (spheres, triangles) = SceneBuilder::build_default_scene();
+        let (spheres, triangles, materials) = SceneBuilder::build_default_scene();
         
         Self {
             camera: Camera::new(),
             spheres,
             triangles,
+            materials,
         }
     }
 }
@@ -546,6 +611,10 @@ impl State {
                     binding: 2,
                     resource: buffers.triangles_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffers.materials_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -620,6 +689,10 @@ impl State {
                     binding: 2,
                     resource: self.buffers.triangles_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.buffers.materials_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -684,9 +757,10 @@ impl State {
         // Update geometry buffers using smart buffer management
         let spheres_resized = self.buffers.update_spheres(&self.render.device, &self.render.queue, &self.scene.spheres);
         let triangles_resized = self.buffers.update_triangles(&self.render.device, &self.render.queue, &self.scene.triangles);
+        let materials_resized = self.buffers.update_materials(&self.render.device, &self.render.queue, &self.scene.materials);
         
         // If buffers were resized, recreate bind groups with new buffers
-        if spheres_resized || triangles_resized {
+        if spheres_resized || triangles_resized || materials_resized {
             self.recreate_bind_groups();
         }
         
@@ -717,6 +791,7 @@ impl State {
                     self.scene.camera,
                     self.scene.spheres.len() as u32,
                     self.scene.triangles.len() as u32,
+                    self.scene.materials.len() as u32,
                     [tile_offset_x, tile_offset_y],
                     [actual_tile_width, actual_tile_height],
                     [self.progressive.tiles_x, self.progressive.tiles_y],
