@@ -1,7 +1,30 @@
 #![no_std]
 
-
+#[cfg(not(target_arch = "spirv"))]
+extern crate alloc;
+#[cfg(not(target_arch = "spirv"))]
+use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
+
+/// Configuration constants for the raytracer
+pub struct RaytracerConfig;
+
+impl RaytracerConfig {
+    pub const TILE_SIZE: u32 = 64;
+    pub const THREAD_GROUP_SIZE: (u32, u32) = (16, 16);
+    pub const DEFAULT_MAX_SPHERES: usize = 64;
+    pub const DEFAULT_MAX_TRIANGLES: usize = 64;
+    pub const CAMERA_MOVE_SPEED: f32 = 0.1;
+    pub const CAMERA_ROTATE_SENSITIVITY: f32 = 0.005;
+    pub const MIN_RAY_DISTANCE: f32 = 0.00001;
+    
+    // GPU configuration constants
+    pub const MAX_PUSH_CONSTANT_SIZE: u32 = 128;
+    pub const PERFORMANCE_STATS_INTERVAL: u64 = 60; // frames
+    pub const CAMERA_PITCH_CLAMP: f32 = 0.99;
+    pub const MILLISECONDS_PER_SECOND: f32 = 1000.0;
+    pub const PROGRESS_PERCENTAGE_SCALE: f32 = 100.0;
+}
 
 /// Camera configuration for raytracing
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -23,6 +46,20 @@ pub struct Sphere {
     pub material: u32, // 0=diffuse, 1=metal, 2=glass
 }
 
+/// Triangle primitive for raytracing
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct Triangle {
+    pub v0: [f32; 3],       // First vertex
+    pub _padding0: f32,     // Padding for alignment
+    pub v1: [f32; 3],       // Second vertex  
+    pub _padding1: f32,     // Padding for alignment
+    pub v2: [f32; 3],       // Third vertex
+    pub _padding2: f32,     // Padding for alignment
+    pub color: [f32; 3],    // Triangle color
+    pub material: u32,      // Material type
+}
+
 /// Push constants for compute shader
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -31,10 +68,12 @@ pub struct PushConstants {
     pub time: f32,
     pub camera: Camera,
     pub sphere_count: u32,
+    pub triangle_count: u32,
     pub tile_offset: [u32; 2],
     pub tile_size: [u32; 2],
     pub total_tiles: [u32; 2],
     pub current_tile_index: u32,
+    pub _padding: u32, // Keep 16-byte alignment
 }
 
 impl Camera {
@@ -67,6 +106,22 @@ impl Sphere {
     }
 }
 
+impl Triangle {
+    /// Create a new triangle
+    pub fn new(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], color: [f32; 3], material: u32) -> Self {
+        Self {
+            v0,
+            _padding0: 0.0,
+            v1,
+            _padding1: 0.0,
+            v2,
+            _padding2: 0.0,
+            color,
+            material,
+        }
+    }
+}
+
 impl PushConstants {
     /// Create new push constants
     pub fn new(
@@ -74,6 +129,7 @@ impl PushConstants {
         time: f32,
         camera: Camera,
         sphere_count: u32,
+        triangle_count: u32,
         tile_offset: [u32; 2],
         tile_size: [u32; 2],
         total_tiles: [u32; 2],
@@ -84,10 +140,97 @@ impl PushConstants {
             time,
             camera,
             sphere_count,
+            triangle_count,
             tile_offset,
             tile_size,
             total_tiles,
             current_tile_index,
+            _padding: 0,
         }
+    }
+}
+
+/// Helper functions for tile calculations
+pub struct TileHelper;
+
+impl TileHelper {
+    /// Calculate number of tiles needed for given dimensions
+    pub fn calculate_tile_count(width: u32, height: u32, tile_size: u32) -> (u32, u32) {
+        let tiles_x = (width + tile_size - 1) / tile_size;
+        let tiles_y = (height + tile_size - 1) / tile_size;
+        (tiles_x, tiles_y)
+    }
+    
+    /// Calculate adaptive tiles per frame based on total tile count
+    pub fn calculate_tiles_per_frame(total_tiles: u32) -> u32 {
+        match total_tiles {
+            0..=16 => total_tiles,        // Render all at once for small images
+            17..=64 => total_tiles / 2,   // 2 batches for medium images  
+            65..=256 => 64,               // More aggressive for larger images
+            257..=1024 => 128,            // Even more aggressive for very large images
+            _ => 256,                     // Maximum parallelism for huge images
+        }.max(1) // Ensure at least 1 tile per frame
+    }
+}
+
+/// Scene management utilities
+#[cfg(not(target_arch = "spirv"))]
+pub struct SceneBuilder {
+    spheres: Vec<Sphere>,
+    triangles: Vec<Triangle>,
+}
+
+#[cfg(not(target_arch = "spirv"))]
+impl SceneBuilder {
+    pub fn new() -> Self {
+        Self {
+            spheres: Vec::new(),
+            triangles: Vec::new(),
+        }
+    }
+    
+    pub fn add_sphere(mut self, center: [f32; 3], radius: f32, color: [f32; 3], material: u32) -> Self {
+        self.spheres.push(Sphere::new(center, radius, color, material));
+        self
+    }
+    
+    pub fn add_triangle(mut self, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], color: [f32; 3], material: u32) -> Self {
+        self.triangles.push(Triangle::new(v0, v1, v2, color, material));
+        self
+    }
+    
+    pub fn build_default_scene() -> (Vec<Sphere>, Vec<Triangle>) {
+        use alloc::vec;
+        let spheres = vec![
+            Sphere::new([0.0, 0.0, -1.0], 0.5, [0.8, 0.3, 0.3], 0),
+            Sphere::new([-1.0, 0.0, -1.0], 0.5, [0.8, 0.8, 0.2], 1),
+            Sphere::new([1.0, 0.0, -1.0], 0.5, [0.2, 0.3, 0.8], 2),
+            Sphere::new([2.0, 0.0, -3.0], 0.5, [0.2, 0.3, 0.8], 2),
+            Sphere::new([-2.0, 0.0, -4.0], 0.5, [0.2, 0.3, 0.8], 1),
+            Sphere::new([-1.0, 2.0, -5.0], 0.5, [0.2, 0.3, 0.8], 1),
+        ];
+        
+        let triangles = vec![
+            Triangle::new(
+                [0.0, 1.0, -2.0],  // Top vertex
+                [-0.5, 0.0, -2.0], // Bottom left
+                [0.5, 0.0, -2.0],  // Bottom right
+                [0.9, 0.1, 0.1],   // Red color
+                0                   // Diffuse material
+            ),
+            Triangle::new(
+                [1.5, 0.5, -3.0],  // Right triangle
+                [1.0, -0.5, -3.0],
+                [2.0, -0.5, -3.0],
+                [0.1, 0.9, 0.1],    // Green color
+                1                    // Metal material
+            ),
+        ];
+        
+        (spheres, triangles)
+    }
+    
+    pub fn build(self) -> (Vec<Sphere>, Vec<Triangle>) {
+        (self.spheres, self.triangles)
     }
 }

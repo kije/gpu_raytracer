@@ -7,52 +7,71 @@ use winit::{
 };
 use bytemuck;
 use wgpu::{TextureUsages, util::make_spirv};
-use raytracer_shared::{Camera, Sphere, PushConstants};
+use raytracer_shared::{Camera, Sphere, Triangle, PushConstants, RaytracerConfig, TileHelper, SceneBuilder};
 
-
-struct State {
+/// GPU resources and rendering pipelines
+struct RenderState {
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     
-    // Compute pipeline for raytracing
+    // Pipelines
     compute_pipeline: wgpu::ComputePipeline,
-    compute_bind_group: wgpu::BindGroup,
-    raytraced_texture: wgpu::Texture,
-    spheres_buffer: wgpu::Buffer,
-    
-    // Render pipeline for displaying texture
     render_pipeline: wgpu::RenderPipeline,
-    render_bind_group: wgpu::BindGroup,
+    
+    // Textures and samplers
+    raytraced_texture: wgpu::Texture,
     sampler: wgpu::Sampler,
     
-    // Scene data
+    // Bind groups
+    compute_bind_group: wgpu::BindGroup,
+    render_bind_group: wgpu::BindGroup,
+}
+
+/// Smart buffer management for geometry data
+struct BufferManager {
+    spheres_buffer: wgpu::Buffer,
+    triangles_buffer: wgpu::Buffer,
+    spheres_capacity: usize,
+    triangles_capacity: usize,
+    spheres_dirty: bool,
+    triangles_dirty: bool,
+}
+
+/// Scene geometry and camera
+struct SceneState {
     camera: Camera,
     spheres: Vec<Sphere>,
-    
-    // Input state
-    mouse_pressed: bool,
-    last_mouse_pos: Option<(f64, f64)>,
-    
-    // Performance metrics
-    start_time: std::time::Instant,
-    last_compute_time: std::time::Duration,
-    frame_count: u64,
-    
-    // Progressive tile rendering
+    triangles: Vec<Triangle>,
+}
+
+/// Progressive tile rendering state
+struct ProgressiveState {
     needs_recompute: bool,
-    tile_size: u32,
     tiles_x: u32,
     tiles_y: u32,
     current_tile: u32,
     is_progressive_rendering: bool,
     progressive_start_time: std::time::Instant,
-    tiles_per_frame: u32, // Number of tiles to process in parallel per frame
+    tiles_per_frame: u32,
 }
 
-impl State {
+/// Input handling state
+struct InputState {
+    mouse_pressed: bool,
+    last_mouse_pos: Option<(f64, f64)>,
+}
+
+/// Performance tracking
+struct PerformanceState {
+    start_time: std::time::Instant,
+    last_compute_time: std::time::Duration,
+    frame_count: u64,
+}
+
+impl RenderState {
     async fn new(window: &winit::window::Window) -> Self {
         let size = window.inner_size();
 
@@ -78,7 +97,7 @@ impl State {
                     label: None,
                     features: wgpu::Features::PUSH_CONSTANTS | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
                     limits: wgpu::Limits {
-                        max_push_constant_size: 128,
+                        max_push_constant_size: RaytracerConfig::MAX_PUSH_CONSTANT_SIZE,
                         ..Default::default()
                     },
                 },
@@ -113,7 +132,6 @@ impl State {
             source: make_spirv(shader_binary),
         });
 
-
         // Create texture for raytraced output
         let raytraced_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Raytraced Texture"),
@@ -142,28 +160,7 @@ impl State {
             ..Default::default()
         });
 
-        // Initialize default camera
-        let camera = Camera::new();
-
-        // Initialize default scene
-        let spheres = vec![
-            Sphere::new([0.0, 0.0, -1.0], 0.5, [0.8, 0.3, 0.3], 0),
-            Sphere::new([-1.0, 0.0, -1.0], 0.5, [0.8, 0.8, 0.2], 1),
-            Sphere::new([1.0, 0.0, -1.0], 0.5, [0.2, 0.3, 0.8], 2),
-            Sphere::new([2.0, 0.0, -3.0], 0.5, [0.2, 0.3, 0.8], 2),
-            Sphere::new([-2.0, 0.0, -4.0], 0.5, [0.2, 0.3, 0.8], 1),
-            Sphere::new([-1.0, 2.0, -5.0], 0.5, [0.2, 0.3, 0.8], 1),
-        ];
-
-        // Create spheres buffer
-        let spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Spheres Buffer"),
-            size: (std::mem::size_of::<Sphere>() * 64) as u64, // Support up to 64 spheres
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Compute bind group layout and bind group
+        // Create placeholder bind groups (will be properly set up later)
         let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Compute Bind Group Layout"),
             entries: &[
@@ -187,27 +184,19 @@ impl State {
                     },
                     count: None,
                 },
-            ],
-        });
-
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: spheres_buffer.as_entire_binding(),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
             ],
         });
 
-        // Render bind group layout and bind group
         let render_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Render Bind Group Layout"),
             entries: &[
@@ -226,23 +215,6 @@ impl State {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
-                },
-            ],
-        });
-
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Render Bind Group"),
-            layout: &render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
         });
@@ -306,20 +278,51 @@ impl State {
             multiview: None,
         });
 
-        // Calculate tile layout
-        let tile_size = 64; // 64x64 pixel tiles
-        let tiles_x = (size.width + tile_size - 1) / tile_size;
-        let tiles_y = (size.height + tile_size - 1) / tile_size;
-        let total_tiles = tiles_x * tiles_y;
-        
-        // Calculate adaptive tiles per frame based on total tile count
-        let tiles_per_frame = match total_tiles {
-            0..=16 => total_tiles,        // Render all at once for small images
-            17..=64 => total_tiles / 2,   // 2 batches for medium images  
-            65..=256 => 64,               // More aggressive for larger images
-            257..=1024 => 128,            // Even more aggressive for very large images
-            _ => 256,                     // Maximum parallelism for huge images
-        }.max(1); // Ensure at least 1 tile per frame
+        // Create dummy bind groups (will be updated with proper buffers)
+        let dummy_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Dummy Buffer"),
+            size: 1024,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Render Bind Group"),
+            layout: &render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
 
         Self {
             surface,
@@ -328,52 +331,251 @@ impl State {
             config,
             size,
             compute_pipeline,
-            compute_bind_group,
-            raytraced_texture,
-            spheres_buffer,
             render_pipeline,
-            render_bind_group,
+            raytraced_texture,
             sampler,
-            camera,
+            compute_bind_group,
+            render_bind_group,
+        }
+    }
+}
+
+impl BufferManager {
+    fn new(device: &wgpu::Device) -> Self {
+        let spheres_capacity = RaytracerConfig::DEFAULT_MAX_SPHERES;
+        let triangles_capacity = RaytracerConfig::DEFAULT_MAX_TRIANGLES;
+
+        let spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Spheres Buffer"),
+            size: (std::mem::size_of::<Sphere>() * spheres_capacity) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        let triangles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Triangles Buffer"),
+            size: (std::mem::size_of::<Triangle>() * triangles_capacity) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            spheres_buffer,
+            triangles_buffer,
+            spheres_capacity,
+            triangles_capacity,
+            spheres_dirty: true,
+            triangles_dirty: true,
+        }
+    }
+
+    /// Update spheres buffer with new data, resizing if necessary
+    fn update_spheres(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, spheres: &[Sphere]) -> bool {
+        let needs_resize = spheres.len() > self.spheres_capacity;
+        
+        if needs_resize {
+            // Double the capacity to accommodate growth
+            self.spheres_capacity = (spheres.len() * 2).max(RaytracerConfig::DEFAULT_MAX_SPHERES);
+            
+            self.spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Spheres Buffer"),
+                size: (std::mem::size_of::<Sphere>() * self.spheres_capacity) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            println!("Resized spheres buffer to capacity: {}", self.spheres_capacity);
+        }
+        
+        if self.spheres_dirty || needs_resize {
+            queue.write_buffer(
+                &self.spheres_buffer,
+                0,
+                bytemuck::cast_slice(spheres),
+            );
+            self.spheres_dirty = false;
+        }
+        
+        needs_resize
+    }
+
+    /// Update triangles buffer with new data, resizing if necessary
+    fn update_triangles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, triangles: &[Triangle]) -> bool {
+        let needs_resize = triangles.len() > self.triangles_capacity;
+        
+        if needs_resize {
+            // Double the capacity to accommodate growth
+            self.triangles_capacity = (triangles.len() * 2).max(RaytracerConfig::DEFAULT_MAX_TRIANGLES);
+            
+            self.triangles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Triangles Buffer"),
+                size: (std::mem::size_of::<Triangle>() * self.triangles_capacity) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            println!("Resized triangles buffer to capacity: {}", self.triangles_capacity);
+        }
+        
+        if self.triangles_dirty || needs_resize {
+            queue.write_buffer(
+                &self.triangles_buffer,
+                0,
+                bytemuck::cast_slice(triangles),
+            );
+            self.triangles_dirty = false;
+        }
+        
+        needs_resize
+    }
+
+    /// Mark spheres buffer as dirty (needs update)
+    fn mark_spheres_dirty(&mut self) {
+        self.spheres_dirty = true;
+    }
+
+    /// Mark triangles buffer as dirty (needs update)
+    fn mark_triangles_dirty(&mut self) {
+        self.triangles_dirty = true;
+    }
+
+    /// Check if any buffers need updating
+    fn needs_update(&self) -> bool {
+        self.spheres_dirty || self.triangles_dirty
+    }
+}
+
+impl SceneState {
+    fn new() -> Self {
+        let (spheres, triangles) = SceneBuilder::build_default_scene();
+        
+        Self {
+            camera: Camera::new(),
             spheres,
-            mouse_pressed: false,
-            last_mouse_pos: None,
-            start_time: std::time::Instant::now(),
-            last_compute_time: std::time::Duration::ZERO,
-            frame_count: 0,
+            triangles,
+        }
+    }
+}
+
+impl ProgressiveState {
+    fn new(width: u32, height: u32) -> Self {
+        let (tiles_x, tiles_y) = TileHelper::calculate_tile_count(width, height, RaytracerConfig::TILE_SIZE);
+        let total_tiles = tiles_x * tiles_y;
+        let tiles_per_frame = TileHelper::calculate_tiles_per_frame(total_tiles);
+
+        Self {
             needs_recompute: true,
-            tile_size,
             tiles_x,
             tiles_y,
             current_tile: 0,
             is_progressive_rendering: false,
             progressive_start_time: std::time::Instant::now(),
-            tiles_per_frame, // Adaptive tiles per frame based on total tile count
+            tiles_per_frame,
+        }
+    }
+}
+
+impl InputState {
+    fn new() -> Self {
+        Self {
+            mouse_pressed: false,
+            last_mouse_pos: None,
+        }
+    }
+}
+
+impl PerformanceState {
+    fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            last_compute_time: std::time::Duration::ZERO,
+            frame_count: 0,
+        }
+    }
+}
+
+/// Main application state
+struct State {
+    render: RenderState,
+    buffers: BufferManager,
+    scene: SceneState,
+    progressive: ProgressiveState,
+    input: InputState,
+    performance: PerformanceState,
+}
+
+impl State {
+    async fn new(window: &winit::window::Window) -> Self {
+        let size = window.inner_size();
+
+        // Initialize render state
+        let mut render = RenderState::new(window).await;
+        
+        // Initialize buffer manager
+        let buffers = BufferManager::new(&render.device);
+        
+        // Initialize scene state
+        let scene = SceneState::new();
+        
+        // Initialize progressive rendering state
+        let progressive = ProgressiveState::new(size.width, size.height);
+        
+        // Initialize input state
+        let input = InputState::new();
+        
+        // Initialize performance state
+        let performance = PerformanceState::new();
+
+        // Now update the render state's bind groups with the proper buffers
+        let compute_bind_group_layout = render.compute_pipeline.get_bind_group_layout(0);
+        render.compute_bind_group = render.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &render.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.spheres_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.triangles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Self {
+            render,
+            buffers,
+            scene,
+            progressive,
+            input,
+            performance,
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            self.render.size = new_size;
+            self.render.config.width = new_size.width;
+            self.render.config.height = new_size.height;
+            self.render.surface.configure(&self.render.device, &self.render.config);
 
             // Recalculate tile layout and adaptive tiles per frame
-            self.tiles_x = (new_size.width + self.tile_size - 1) / self.tile_size;
-            self.tiles_y = (new_size.height + self.tile_size - 1) / self.tile_size;
-            let total_tiles = self.tiles_x * self.tiles_y;
+            let (tiles_x, tiles_y) = TileHelper::calculate_tile_count(new_size.width, new_size.height, RaytracerConfig::TILE_SIZE);
+            self.progressive.tiles_x = tiles_x;
+            self.progressive.tiles_y = tiles_y;
+            let total_tiles = tiles_x * tiles_y;
             
-            self.tiles_per_frame = match total_tiles {
-                0..=16 => total_tiles,        // Render all at once for small images
-                17..=64 => total_tiles / 2,   // 2 batches for medium images  
-                65..=256 => 64,               // More aggressive for larger images
-                257..=1024 => 128,            // Even more aggressive for very large images
-                _ => 256,                     // Maximum parallelism for huge images
-            }.max(1); // Ensure at least 1 tile per frame
+            self.progressive.tiles_per_frame = TileHelper::calculate_tiles_per_frame(total_tiles);
 
             // Recreate raytraced texture
-            self.raytraced_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            self.render.raytraced_texture = self.render.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Raytraced Texture"),
                 size: wgpu::Extent3d {
                     width: new_size.width,
@@ -391,47 +593,51 @@ impl State {
             // Recreate bind groups with new texture
             self.recreate_bind_groups();
 
-            self.needs_recompute = true;
-            self.current_tile = 0;
-            self.is_progressive_rendering = false;
+            self.progressive.needs_recompute = true;
+            self.progressive.current_tile = 0;
+            self.progressive.is_progressive_rendering = false;
         }
     }
     
     fn recreate_bind_groups(&mut self) {
         // Recreate compute bind group
-        let compute_bind_group_layout = self.compute_pipeline.get_bind_group_layout(0);
-        self.compute_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let compute_bind_group_layout = self.render.compute_pipeline.get_bind_group_layout(0);
+        self.render.compute_bind_group = self.render.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Compute Bind Group"),
             layout: &compute_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &self.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        &self.render.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
                     ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.spheres_buffer.as_entire_binding(),
+                    resource: self.buffers.spheres_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.buffers.triangles_buffer.as_entire_binding(),
                 },
             ],
         });
 
         // Recreate render bind group
-        let render_bind_group_layout = self.render_pipeline.get_bind_group_layout(0);
-        self.render_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let render_bind_group_layout = self.render.render_pipeline.get_bind_group_layout(0);
+        self.render.render_bind_group = self.render.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Render Bind Group"),
             layout: &render_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &self.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        &self.render.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
                     ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.render.sampler),
                 },
             ],
         });
@@ -439,111 +645,114 @@ impl State {
     
     fn run_compute(&mut self) {
         // Start progressive rendering if we need to recompute
-        if self.needs_recompute && !self.is_progressive_rendering {
-            self.is_progressive_rendering = true;
-            self.current_tile = 0;
-            self.progressive_start_time = std::time::Instant::now();
-            self.needs_recompute = false;
+        if self.progressive.needs_recompute && !self.progressive.is_progressive_rendering {
+            self.progressive.is_progressive_rendering = true;
+            self.progressive.current_tile = 0;
+            self.progressive.progressive_start_time = std::time::Instant::now();
+            self.progressive.needs_recompute = false;
             
             println!("Starting parallel progressive render: {}x{} tiles, {} tiles per frame", 
-                     self.tiles_x, self.tiles_y, self.tiles_per_frame);
+                     self.progressive.tiles_x, self.progressive.tiles_y, self.progressive.tiles_per_frame);
         }
         
         // Continue progressive rendering if in progress
-        if !self.is_progressive_rendering {
+        if !self.progressive.is_progressive_rendering {
             return;
         }
 
-        let total_tiles = self.tiles_x * self.tiles_y;
-        if self.current_tile >= total_tiles {
+        let total_tiles = self.progressive.tiles_x * self.progressive.tiles_y;
+        if self.progressive.current_tile >= total_tiles {
             // Progressive rendering completed
-            self.is_progressive_rendering = false;
-            let total_time = self.progressive_start_time.elapsed();
-            println!("Progressive render completed in {:.2}ms", total_time.as_secs_f32() * 1000.0);
+            self.progressive.is_progressive_rendering = false;
+            let total_time = self.progressive.progressive_start_time.elapsed();
+            println!("Progressive render completed in {:.2}ms", total_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND);
             return;
         }
 
         let compute_start = std::time::Instant::now();
         
         // Calculate how many tiles to process this frame
-        let tiles_remaining = total_tiles - self.current_tile;
-        let tiles_this_frame = std::cmp::min(self.tiles_per_frame, tiles_remaining);
+        let tiles_remaining = total_tiles - self.progressive.current_tile;
+        let tiles_this_frame = std::cmp::min(self.progressive.tiles_per_frame, tiles_remaining);
         
         let mut encoder = self
-            .device
+            .render.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Parallel Compute Encoder"),
             });
         
-        // Update spheres buffer once for all tiles
-        self.queue.write_buffer(
-            &self.spheres_buffer,
-            0,
-            bytemuck::cast_slice(&self.spheres),
-        );
+        // Update geometry buffers using smart buffer management
+        let spheres_resized = self.buffers.update_spheres(&self.render.device, &self.render.queue, &self.scene.spheres);
+        let triangles_resized = self.buffers.update_triangles(&self.render.device, &self.render.queue, &self.scene.triangles);
+        
+        // If buffers were resized, recreate bind groups with new buffers
+        if spheres_resized || triangles_resized {
+            self.recreate_bind_groups();
+        }
         
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Parallel Compute Pass"),
             });
 
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.set_pipeline(&self.render.compute_pipeline);
+            compute_pass.set_bind_group(0, &self.render.compute_bind_group, &[]);
 
             // Process multiple tiles in parallel
             for i in 0..tiles_this_frame {
-                let tile_index = self.current_tile + i;
-                let tile_x = tile_index % self.tiles_x;
-                let tile_y = tile_index / self.tiles_x;
+                let tile_index = self.progressive.current_tile + i;
+                let tile_x = tile_index % self.progressive.tiles_x;
+                let tile_y = tile_index / self.progressive.tiles_x;
                 
-                let tile_offset_x = tile_x * self.tile_size;
-                let tile_offset_y = tile_y * self.tile_size;
+                let tile_offset_x = tile_x * RaytracerConfig::TILE_SIZE;
+                let tile_offset_y = tile_y * RaytracerConfig::TILE_SIZE;
                 
                 // Calculate actual tile size (handle edge tiles)
-                let actual_tile_width = std::cmp::min(self.tile_size, self.size.width - tile_offset_x);
-                let actual_tile_height = std::cmp::min(self.tile_size, self.size.height - tile_offset_y);
+                let actual_tile_width = std::cmp::min(RaytracerConfig::TILE_SIZE, self.render.size.width - tile_offset_x);
+                let actual_tile_height = std::cmp::min(RaytracerConfig::TILE_SIZE, self.render.size.height - tile_offset_y);
                 
-                let push_constants = PushConstants {
-                    resolution: [self.size.width as f32, self.size.height as f32],
-                    time: self.start_time.elapsed().as_secs_f32(),
-                    camera: self.camera,
-                    sphere_count: self.spheres.len() as u32,
-                    tile_offset: [tile_offset_x, tile_offset_y],
-                    tile_size: [actual_tile_width, actual_tile_height],
-                    total_tiles: [self.tiles_x, self.tiles_y],
-                    current_tile_index: tile_index,
-                };
+                let push_constants = PushConstants::new(
+                    [self.render.size.width as f32, self.render.size.height as f32],
+                    self.performance.start_time.elapsed().as_secs_f32(),
+                    self.scene.camera,
+                    self.scene.spheres.len() as u32,
+                    self.scene.triangles.len() as u32,
+                    [tile_offset_x, tile_offset_y],
+                    [actual_tile_width, actual_tile_height],
+                    [self.progressive.tiles_x, self.progressive.tiles_y],
+                    tile_index,
+                );
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 
                 // Dispatch workgroups for current tile
-                let workgroup_x = (actual_tile_width + 15) / 16;
-                let workgroup_y = (actual_tile_height + 15) / 16;
+                let workgroup_x = (actual_tile_width + RaytracerConfig::THREAD_GROUP_SIZE.0 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.0;
+                let workgroup_y = (actual_tile_height + RaytracerConfig::THREAD_GROUP_SIZE.1 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.1;
                 compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
             }
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.render.queue.submit(std::iter::once(encoder.finish()));
         
         // Don't wait for GPU - allow frame to be displayed immediately
-        self.last_compute_time = compute_start.elapsed();
+        self.performance.last_compute_time = compute_start.elapsed();
         
         // Move to next set of tiles
-        self.current_tile += tiles_this_frame;
+        self.progressive.current_tile += tiles_this_frame;
         
         // Progress feedback
-        if self.current_tile % self.tiles_per_frame == 0 || self.current_tile == total_tiles {
-            let progress = (self.current_tile as f32 / total_tiles as f32) * 100.0;
+        if self.progressive.current_tile % self.progressive.tiles_per_frame == 0 || self.progressive.current_tile == total_tiles {
+            let progress = (self.progressive.current_tile as f32 / total_tiles as f32) * RaytracerConfig::PROGRESS_PERCENTAGE_SCALE;
             println!("Progress: {:.1}% ({}/{}) - {} tiles/frame", 
-                     progress, self.current_tile, total_tiles, tiles_this_frame);
+                     progress, self.progressive.current_tile, total_tiles, tiles_this_frame);
         }
     }
 
     pub fn trigger_recompute(&mut self) {
-        self.needs_recompute = true;
+        self.progressive.needs_recompute = true;
     }
 
     fn rotate_camera(&mut self, delta_x: f64, delta_y: f64) {
-        let sensitivity = 0.005;
+        let sensitivity = RaytracerConfig::CAMERA_ROTATE_SENSITIVITY;
         let delta_x = delta_x as f32 * sensitivity;
         let delta_y = delta_y as f32 * sensitivity;
         
@@ -552,72 +761,72 @@ impl State {
         let sin_yaw = delta_x.sin();
         
         // Rotate direction vector around Y axis
-        let old_dir_x = self.camera.direction[0];
-        let old_dir_z = self.camera.direction[2];
-        self.camera.direction[0] = old_dir_x * cos_yaw - old_dir_z * sin_yaw;
-        self.camera.direction[2] = old_dir_x * sin_yaw + old_dir_z * cos_yaw;
+        let old_dir_x = self.scene.camera.direction[0];
+        let old_dir_z = self.scene.camera.direction[2];
+        self.scene.camera.direction[0] = old_dir_x * cos_yaw - old_dir_z * sin_yaw;
+        self.scene.camera.direction[2] = old_dir_x * sin_yaw + old_dir_z * cos_yaw;
         
         // Simple pitch rotation (just modify Y component)
-        self.camera.direction[1] = (self.camera.direction[1] - delta_y).clamp(-0.99, 0.99);
+        self.scene.camera.direction[1] = (self.scene.camera.direction[1] - delta_y).clamp(-RaytracerConfig::CAMERA_PITCH_CLAMP, RaytracerConfig::CAMERA_PITCH_CLAMP);
         
         // Normalize direction
-        let len = (self.camera.direction[0].powi(2) + 
-                  self.camera.direction[1].powi(2) + 
-                  self.camera.direction[2].powi(2)).sqrt();
+        let len = (self.scene.camera.direction[0].powi(2) + 
+                  self.scene.camera.direction[1].powi(2) + 
+                  self.scene.camera.direction[2].powi(2)).sqrt();
         if len > 0.0 {
-            self.camera.direction[0] /= len;
-            self.camera.direction[1] /= len;
-            self.camera.direction[2] /= len;
+            self.scene.camera.direction[0] /= len;
+            self.scene.camera.direction[1] /= len;
+            self.scene.camera.direction[2] /= len;
         }
         
-        self.needs_recompute = true;
-        self.current_tile = 0;
-        self.is_progressive_rendering = false;
+        self.progressive.needs_recompute = true;
+        self.progressive.current_tile = 0;
+        self.progressive.is_progressive_rendering = false;
     }
     
     fn move_camera(&mut self, forward: f32, right: f32) {
-        let speed = 0.1;
+        let speed = RaytracerConfig::CAMERA_MOVE_SPEED;
         
         // Forward/backward movement
-        self.camera.position[0] += self.camera.direction[0] * forward * speed;
-        self.camera.position[1] += self.camera.direction[1] * forward * speed;
-        self.camera.position[2] += self.camera.direction[2] * forward * speed;
+        self.scene.camera.position[0] += self.scene.camera.direction[0] * forward * speed;
+        self.scene.camera.position[1] += self.scene.camera.direction[1] * forward * speed;
+        self.scene.camera.position[2] += self.scene.camera.direction[2] * forward * speed;
         
         // Right/left movement (cross product of direction and up)
         let right_vec = [
-            self.camera.direction[1] * self.camera.up[2] - self.camera.direction[2] * self.camera.up[1],
-            self.camera.direction[2] * self.camera.up[0] - self.camera.direction[0] * self.camera.up[2],
-            self.camera.direction[0] * self.camera.up[1] - self.camera.direction[1] * self.camera.up[0],
+            self.scene.camera.direction[1] * self.scene.camera.up[2] - self.scene.camera.direction[2] * self.scene.camera.up[1],
+            self.scene.camera.direction[2] * self.scene.camera.up[0] - self.scene.camera.direction[0] * self.scene.camera.up[2],
+            self.scene.camera.direction[0] * self.scene.camera.up[1] - self.scene.camera.direction[1] * self.scene.camera.up[0],
         ];
         
-        self.camera.position[0] += right_vec[0] * right * speed;
-        self.camera.position[1] += right_vec[1] * right * speed;
-        self.camera.position[2] += right_vec[2] * right * speed;
+        self.scene.camera.position[0] += right_vec[0] * right * speed;
+        self.scene.camera.position[1] += right_vec[1] * right * speed;
+        self.scene.camera.position[2] += right_vec[2] * right * speed;
         
-        self.needs_recompute = true;
-        self.current_tile = 0;
-        self.is_progressive_rendering = false;
+        self.progressive.needs_recompute = true;
+        self.progressive.current_tile = 0;
+        self.progressive.is_progressive_rendering = false;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.frame_count += 1;
+        self.performance.frame_count += 1;
         
         // Print performance stats every 60 frames
-        if self.frame_count % 60 == 0 {
-            let elapsed = self.start_time.elapsed().as_secs_f32();
-            let fps = self.frame_count as f32 / elapsed;
+        if self.performance.frame_count % RaytracerConfig::PERFORMANCE_STATS_INTERVAL == 0 {
+            let elapsed = self.performance.start_time.elapsed().as_secs_f32();
+            let fps = self.performance.frame_count as f32 / elapsed;
             println!("FPS: {:.1}, Last compute: {:.2}ms", 
                      fps, 
-                     self.last_compute_time.as_secs_f32() * 1000.0);
+                     self.performance.last_compute_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND);
         }
         
-        let output = self.surface.get_current_texture()?;
+        let output = self.render.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
-            .device
+            .render.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
@@ -641,12 +850,12 @@ impl State {
                 depth_stencil_attachment: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.render_bind_group, &[]);
+            render_pass.set_pipeline(&self.render.render_pipeline);
+            render_pass.set_bind_group(0, &self.render.render_bind_group, &[]);
             render_pass.draw(0..3, 0..1); // Draw fullscreen triangle
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.render.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
@@ -692,7 +901,7 @@ async fn run() {
                 } => {
                     match key {
                         VirtualKeyCode::Space => {
-                            state.needs_recompute = true;
+                            state.progressive.needs_recompute = true;
                         }
                         VirtualKeyCode::W => {
                             state.move_camera(1.0, 0.0);
@@ -717,17 +926,17 @@ async fn run() {
                     state: button_state,
                     ..
                 } => {
-                    state.mouse_pressed = *button_state == ElementState::Pressed;
+                    state.input.mouse_pressed = *button_state == ElementState::Pressed;
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    if state.mouse_pressed {
-                        if let Some(last_pos) = state.last_mouse_pos {
+                    if state.input.mouse_pressed {
+                        if let Some(last_pos) = state.input.last_mouse_pos {
                             let delta_x = position.x - last_pos.0;
                             let delta_y = position.y - last_pos.1;
                             state.rotate_camera(delta_x, delta_y);
                         }
                     }
-                    state.last_mouse_pos = Some((position.x, position.y));
+                    state.input.last_mouse_pos = Some((position.x, position.y));
                 }
                 _ => {}
             },
@@ -735,7 +944,7 @@ async fn run() {
                 state.run_compute();
                 match state.render() {
                     Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.render.size),
                     Err(wgpu::SurfaceError::OutOfMemory) => control_flow.set_exit(),
                     Err(e) => eprintln!("{:?}", e),
                 }
