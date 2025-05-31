@@ -37,15 +37,14 @@ pub struct Camera {
 }
 
 /// Enhanced PBR Material properties for raytracing
+/// Optimized with f16 packed into u32 for improved memory bandwidth
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct Material {
-    pub albedo: [f32; 3],          // Base color/albedo
-    pub metallic: f32,             // Metallic factor (0.0 = dielectric, 1.0 = metallic)
-    pub roughness: f32,            // Surface roughness (0.0 = mirror, 1.0 = rough)
-    pub emission: [f32; 3],        // Emissive color
-    pub ior: f32,                  // Index of refraction for dielectrics
-    pub transmission: f32,         // Transmission factor (0.0 = opaque, 1.0 = transparent)
+    pub albedo: [f32; 3],          // Base color/albedo (keep f32 for color accuracy)
+    pub metallic_roughness_f16: u32, // Packed: metallic(low 16 bits) + roughness(high 16 bits) as f16
+    pub emission: [f32; 3],        // Emissive color (keep f32 for color accuracy)
+    pub ior_transmission_f16: u32, // Packed: ior(low 16 bits) + transmission(high 16 bits) as f16
     pub specular_factor: f32,      // KHR_materials_specular
     pub specular_color: [f32; 3],  // KHR_materials_specular
     pub attenuation_distance: f32, // KHR_materials_volume
@@ -181,6 +180,29 @@ impl Default for Camera {
 }
 
 impl Material {
+    /// Convert f32 to f16 stored as u16 (host-side helper)
+    #[cfg(not(target_arch = "spirv"))]
+    fn f32_to_f16_u16(value: f32) -> u16 {
+        // Simple f32 to f16 conversion for host side
+        // This is a simplified conversion - in practice, use proper f16 conversion
+        let bits = value.to_bits();
+        let sign = (bits >> 31) & 0x1;
+        let exp = ((bits >> 23) & 0xFF) as i32;
+        let frac = bits & 0x7FFFFF;
+        
+        // Handle special cases
+        if exp == 0 { return (sign << 15) as u16; } // Zero/denormal
+        if exp == 255 { return ((sign << 15) | 0x7C00 | if frac != 0 { 0x200 } else { 0 }) as u16; } // Inf/NaN
+        
+        // Rebias exponent from f32 to f16
+        let new_exp = exp - 127 + 15;
+        if new_exp <= 0 { return (sign << 15) as u16; } // Underflow to zero
+        if new_exp >= 31 { return ((sign << 15) | 0x7C00) as u16; } // Overflow to infinity
+        
+        // Pack f16
+        ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+    }
+    
     /// Create a new enhanced PBR material
     pub fn new(
         albedo: [f32; 3],
@@ -190,23 +212,54 @@ impl Material {
         ior: f32,
         transmission: f32,
     ) -> Self {
-        Self {
-            albedo,
-            metallic,
-            roughness,
-            emission,
-            ior,
-            transmission,
-            specular_factor: 1.0,
-            specular_color: [1.0, 1.0, 1.0],
-            attenuation_distance: f32::INFINITY,
-            attenuation_color: [1.0, 1.0, 1.0],
-            thickness_factor: 0.0,
-            diffuse_factor: albedo,
-            glossiness_factor: 1.0 - roughness,
-            material_type: 0, // metallic-roughness workflow
-            texture_indices: [u32::MAX; 8], // No textures by default
-            _padding: [0.0; 2],
+        #[cfg(not(target_arch = "spirv"))]
+        {
+            // Pack metallic and roughness into single u32
+            let metallic_f16 = Self::f32_to_f16_u16(metallic);
+            let roughness_f16 = Self::f32_to_f16_u16(roughness);
+            let metallic_roughness_packed = (metallic_f16 as u32) | ((roughness_f16 as u32) << 16);
+            
+            // Pack ior and transmission into single u32
+            let ior_f16 = Self::f32_to_f16_u16(ior);
+            let transmission_f16 = Self::f32_to_f16_u16(transmission);
+            let ior_transmission_packed = (ior_f16 as u32) | ((transmission_f16 as u32) << 16);
+            
+            Self {
+                albedo,
+                metallic_roughness_f16: metallic_roughness_packed,
+                emission,
+                ior_transmission_f16: ior_transmission_packed,
+                specular_factor: 1.0,
+                specular_color: [1.0, 1.0, 1.0],
+                attenuation_distance: f32::INFINITY,
+                attenuation_color: [1.0, 1.0, 1.0],
+                thickness_factor: 0.0,
+                diffuse_factor: albedo,
+                glossiness_factor: 1.0 - roughness,
+                material_type: 0, // metallic-roughness workflow
+                texture_indices: [u32::MAX; 8], // No textures by default
+                _padding: [0.0; 2],
+            }
+        }
+        #[cfg(target_arch = "spirv")]
+        {
+            // On GPU, we'll have proper f16 conversion functions
+            Self {
+                albedo,
+                metallic_roughness_f16: 0, // Will be handled by shader conversion functions
+                emission,
+                ior_transmission_f16: 0,
+                specular_factor: 1.0,
+                specular_color: [1.0, 1.0, 1.0],
+                attenuation_distance: f32::INFINITY,
+                attenuation_color: [1.0, 1.0, 1.0],
+                thickness_factor: 0.0,
+                diffuse_factor: albedo,
+                glossiness_factor: 1.0 - roughness,
+                material_type: 0,
+                texture_indices: [u32::MAX; 8],
+                _padding: [0.0; 2],
+            }
         }
     }
     
@@ -263,6 +316,38 @@ impl Material {
     pub fn with_textures(mut self, textures: [u32; 8]) -> Self {
         self.texture_indices = textures;
         self
+    }
+    
+    /// Set metallic factor from f32 (converts to f16 and packs)
+    #[cfg(not(target_arch = "spirv"))]
+    pub fn set_metallic(&mut self, value: f32) {
+        let metallic_f16 = Self::f32_to_f16_u16(value);
+        // Keep existing roughness, update metallic (low 16 bits)
+        self.metallic_roughness_f16 = (self.metallic_roughness_f16 & 0xFFFF0000) | (metallic_f16 as u32);
+    }
+    
+    /// Set roughness factor from f32 (converts to f16 and packs)
+    #[cfg(not(target_arch = "spirv"))]
+    pub fn set_roughness(&mut self, value: f32) {
+        let roughness_f16 = Self::f32_to_f16_u16(value);
+        // Keep existing metallic, update roughness (high 16 bits)
+        self.metallic_roughness_f16 = (self.metallic_roughness_f16 & 0x0000FFFF) | ((roughness_f16 as u32) << 16);
+    }
+    
+    /// Set IOR from f32 (converts to f16 and packs)
+    #[cfg(not(target_arch = "spirv"))]
+    pub fn set_ior(&mut self, value: f32) {
+        let ior_f16 = Self::f32_to_f16_u16(value);
+        // Keep existing transmission, update ior (low 16 bits)
+        self.ior_transmission_f16 = (self.ior_transmission_f16 & 0xFFFF0000) | (ior_f16 as u32);
+    }
+    
+    /// Set transmission factor from f32 (converts to f16 and packs)
+    #[cfg(not(target_arch = "spirv"))]
+    pub fn set_transmission(&mut self, value: f32) {
+        let transmission_f16 = Self::f32_to_f16_u16(value);
+        // Keep existing ior, update transmission (high 16 bits)
+        self.ior_transmission_f16 = (self.ior_transmission_f16 & 0x0000FFFF) | ((transmission_f16 as u32) << 16);
     }
 }
 
@@ -530,9 +615,9 @@ impl TileHelper {
     pub fn calculate_tiles_per_frame(total_tiles: u32) -> u32 {
         match total_tiles {
             0..=16 => total_tiles,        // Render all at once for small images
-            17..=64 => 8,                 // Very conservative for medium images  
-            65..=256 => 2,                // Ultra conservative for larger images
-            257..=1024 => 1,              // Single tile per frame for very large images
+            17..=64 => total_tiles / 8,                 // Very conservative for medium images  
+            65..=256 => total_tiles / 32,                // Ultra conservative for larger images
+            257..=1024 => total_tiles / 64,              //l Single tile per frame for very large images
             _ => 1,                       // Absolute minimum for huge images
         }.max(1) // Ensure at least 1 tile per frame
     }

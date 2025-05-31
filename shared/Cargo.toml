@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
+glam = { version = "0.29", default-features = false, features = ["bytemuck", "fast-math", "scalar-math"] } # no default features to avoid "std" getting enabled by default
 
 # Optional spirv-std for shader compilation
 [dependencies.spirv-std]
@@ -13,4 +14,4 @@ optional = true
 
 [features]
 default = []
-shader = ["spirv-std"]
+shader = ["spirv-std", "glam/libm"]

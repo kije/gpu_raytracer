@@ -390,12 +390,12 @@ impl GltfLoader {
 
         // Handle transmission (KHR_materials_transmission)
         if let Some(transmission) = gltf_material.transmission() {
-            material.transmission = transmission.transmission_factor();
+            material.set_transmission(transmission.transmission_factor());
         }
 
         // Handle IOR (KHR_materials_ior)
         if let Some(ior) = gltf_material.ior() {
-            material.ior = ior;
+            material.set_ior(ior);
         }
 
         // Handle specular (KHR_materials_specular)

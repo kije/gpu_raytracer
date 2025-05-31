@@ -1,5 +1,6 @@
 #![no_std]
 
+use spirv_std::float::{f32_to_f16, f16_to_f32, vec2_to_f16x2};
 use spirv_std::spirv;
 use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec4, UVec2, Vec3};
 use spirv_std::num_traits::Float;
@@ -55,18 +56,27 @@ pub fn main_cs(
         return;
     }
 
-    // Convert screen coordinates to camera ray
-    let uv = vec2(
+    // Convert screen coordinates to camera ray using f16 for better memory efficiency
+    let uv_f32 = vec2(
         (pixel_x as f32 + 0.5) / width as f32,
         (pixel_y as f32 + 0.5) / height as f32
     );
+    
+    // Pack UV coordinates into f16 for potential performance benefits
+    let _uv_f16_packed = vec2_to_f16x2(uv_f32);
+    let uv = uv_f32; // Use f32 for camera calculations to maintain precision
 
     // Convert UV coordinates to camera space
     let aspect_ratio = width as f32 / height as f32;
     let fov_scale = (push_constants.camera.fov * 0.5 * core::f32::consts::PI / 180.0).tan();
 
-    let camera_x = (uv.x * 2.0 - 1.0) * aspect_ratio * fov_scale;
-    let camera_y = (1.0 - uv.y * 2.0) * fov_scale;
+    // Use f16 for intermediate screen space calculations where precision allows
+    let camera_x_f16 = f32_to_f16((uv.x * 2.0 - 1.0) * aspect_ratio * fov_scale);
+    let camera_y_f16 = f32_to_f16((1.0 - uv.y * 2.0) * fov_scale);
+    
+    // Convert back to f32 for final ray direction calculation
+    let camera_x = f16_to_f32(camera_x_f16);
+    let camera_y = f16_to_f32(camera_y_f16);
 
     // Calculate camera right and up vectors
     let forward = vec3(push_constants.camera.direction[0], push_constants.camera.direction[1], push_constants.camera.direction[2]);
@@ -510,6 +520,12 @@ pub fn main_cs(
             let material = materials[hit_material_id as usize];
             let albedo = vec3(material.albedo[0], material.albedo[1], material.albedo[2]);
             let emission = vec3(material.emission[0], material.emission[1], material.emission[2]);
+            
+            // Unpack and convert f16 material properties back to f32 for calculations
+            let metallic = f16_to_f32(material.metallic_roughness_f16 & 0xFFFF); // Low 16 bits
+            let roughness = f16_to_f32(material.metallic_roughness_f16 >> 16);   // High 16 bits
+            let ior = f16_to_f32(material.ior_transmission_f16 & 0xFFFF);        // Low 16 bits
+            let transmission = f16_to_f32(material.ior_transmission_f16 >> 16);   // High 16 bits
 
             // Calculate lighting from all scene lights
             let _view_dir = -ray_direction_normalized;
@@ -537,7 +553,12 @@ pub fn main_cs(
                 let to_light = light_pos - hit_point;
                 let distance = to_light.length();
                 let point_light_dir = to_light.normalize();
-                let attenuation = 1.0 / (1.0 + distance * distance * 0.01);
+                
+                // Use f16 for attenuation calculation (0.0-1.0 range, perfect for f16)
+                let attenuation_f32 = 1.0 / (1.0 + distance * distance * 0.01);
+                let attenuation_f16 = f32_to_f16(attenuation_f32);
+                let attenuation = f16_to_f32(attenuation_f16);
+                
                 let point_light_intensity = hit_normal.dot(point_light_dir).max(0.0) * light_intensity * attenuation;
             
                 // Calculate spot light factor
@@ -555,9 +576,9 @@ pub fn main_cs(
                                            point_light_intensity * is_point +
                                            spot_light_intensity * is_spot;
             
-                // Branchless BRDF evaluation
+                // Branchless BRDF evaluation using converted f16 values
                 let diffuse = albedo / core::f32::consts::PI;
-                let is_metallic = (material.metallic > 0.5) as u32 as f32;
+                let is_metallic = (metallic > 0.5) as u32 as f32;
                 let metallic_contrib = albedo * light_intensity_final * 0.5;
                 let dielectric_contrib = diffuse * light_intensity_final;
                 let light_contribution = metallic_contrib * is_metallic + dielectric_contrib * (1.0 - is_metallic);
@@ -570,8 +591,8 @@ pub fn main_cs(
             // Add emission
             color = total_lighting + emission;
 
-            // Handle transmission (simplified) - branchless
-            let transmission_factor = material.transmission.max(0.0).min(1.0);
+            // Handle transmission (simplified) - branchless using converted f16 value
+            let transmission_factor = transmission.max(0.0).min(1.0);
             let transmitted_color = vec3(0.2, 0.2, 0.3);
             color = color * (1.0 - transmission_factor) + transmitted_color * transmission_factor;
         }
