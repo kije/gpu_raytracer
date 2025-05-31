@@ -371,13 +371,14 @@ impl TileHelper {
     }
     
     /// Calculate adaptive tiles per frame based on total tile count
+    /// Made much more conservative to prevent system hangs with large triangle counts
     pub fn calculate_tiles_per_frame(total_tiles: u32) -> u32 {
         match total_tiles {
             0..=16 => total_tiles,        // Render all at once for small images
-            17..=64 => total_tiles / 2,   // 2 batches for medium images  
-            65..=256 => 64,               // More aggressive for larger images
-            257..=1024 => 128,            // Even more aggressive for very large images
-            _ => 256,                     // Maximum parallelism for huge images
+            17..=64 => 4,                 // Very conservative for medium images  
+            65..=256 => 2,                // Ultra conservative for larger images
+            257..=1024 => 1,              // Single tile per frame for very large images
+            _ => 1,                       // Absolute minimum for huge images
         }.max(1) // Ensure at least 1 tile per frame
     }
 }
@@ -455,5 +456,80 @@ impl SceneBuilder {
     
     pub fn build(self) -> (Vec<Sphere>, Vec<Triangle>, Vec<Material>) {
         (self.spheres, self.triangles, self.materials)
+    }
+}
+
+#[macro_export]
+macro_rules! branchless_float_if {
+    ($condition:expr, $if_true:expr, $if_false:expr) => {
+        branchless_float_if!($condition, $if_true, $if_false, (f32::MAX), &(f32::MAX - 1.0), lt)
+    };
+    ($condition:expr, $if_true:expr, $if_false:expr, $max_val: expr, $max_minus_one_val: expr, $cmp_lt_method: ident) => {
+        {{
+            // if $if_true is nan => min will return $if_true+($if_false * 1.0_f32.copysign($if_false)
+            let actual_if_true = ($if_true).min($max_val); // min returns the smaller of the two, but if eitehr is nan, the other is returned -> result here will be either valid if_true or max
+            let actual_if_false = ($if_false).min($max_val);
+
+            let true_contrib = branchless_float_if!(@nonnan; actual_if_true.$cmp_lt_method($max_minus_one_val), actual_if_true, actual_if_false);
+            let false_contrib = branchless_float_if!(@nonnan; actual_if_false.$cmp_lt_method($max_minus_one_val), actual_if_false, actual_if_true);
+
+           let res = branchless_float_if!(@nonnan; $condition, true_contrib, false_contrib);
+
+            // (res, res_is_valid)
+            (res, res.$cmp_lt_method($max_minus_one_val))
+        }}
+    };
+    (@nonnan; $condition:expr, $if_true:expr, $if_false:expr) => {
+        ((($condition) as u32) as f32) * ($if_true) + ((($condition) as u32) ^ 1) as f32 * ($if_false)
+    }
+}
+
+#[macro_export]
+macro_rules! branchless_u32_if {
+    ($condition:expr, $if_true:expr, $if_false:expr) => {
+        {{
+            use ::core::ops::{BitXor, BitAnd};
+            ($if_true).bitxor(($if_true).bitxor($if_false).bitand((0u32 + (1u32 * ($condition as u32))).wrapping_sub(1)))
+        }}
+    };
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn branchless_float_if_trivial_non_nan() {
+        assert_eq!(branchless_float_if!(@nonnan; true, 0.5f32, -1.0), 0.5);
+        assert_eq!(branchless_float_if!(@nonnan; false, 0.5f32, -1.0), -1.0);
+
+        assert_eq!(branchless_float_if!(@nonnan; true, 2.5f32, -3000.0), 2.5);
+        assert_eq!(branchless_float_if!(@nonnan; false, 2.5f32, -3000.0), -3000.0);
+    }
+
+    #[test]
+    fn branchless_float_if_trivial() {
+        assert_eq!(branchless_float_if!(true, 0.5f32, -1.0f32), (0.5, true));
+        assert_eq!(branchless_float_if!(false, 0.5f32, -1.0f32), (-1.0, true));
+
+        assert_eq!(branchless_float_if!(true, -0.5f32, 1.0f32), (-0.5, true));
+        assert_eq!(branchless_float_if!(false, -0.5f32, 1.0f32), (1.0,  true));
+    }
+
+    #[test]
+    fn branchless_float_if_nan_values() {
+        assert_eq!(branchless_float_if!(true, 0.5f32, f32::NAN), (0.5, true));
+        assert_eq!(branchless_float_if!(true, -0.5f32, f32::NAN), (-0.5, true));
+
+        assert_eq!(branchless_float_if!(false, 0.5f32, f32::NAN), (0.5, true));
+        assert_eq!(branchless_float_if!(false, -0.5f32, f32::NAN), (-0.5, true));
+
+        assert_eq!(branchless_float_if!(true, f32::NAN, 1.0f32), (1.0, true));
+        assert_eq!(branchless_float_if!(true, f32::NAN, -1.0f32), (-1.0, true));
+
+        assert_eq!(branchless_float_if!(false, f32::NAN, 1.0f32), (1.0, true));
+        assert_eq!(branchless_float_if!(false, f32::NAN, -1.0f32), (-1.0, true));
+
+        assert_eq!(branchless_float_if!(false, f32::NAN, f32::NAN), (f32::MAX, false));
     }
 }

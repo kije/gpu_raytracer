@@ -1,5 +1,6 @@
 #![feature(build_hasher_simple_hash_one)]
 
+use std::mem;
 use winit::{
     event::{Event, WindowEvent, KeyboardInput, VirtualKeyCode, ElementState, MouseButton},
     event_loop::EventLoop,
@@ -11,6 +12,7 @@ use raytracer_shared::{Camera, Sphere, Triangle, Material, Light, TextureInfo, P
 
 mod gltf_loader;
 use gltf_loader::{GltfLoader, GltfError, LoadedScene};
+
 
 /// GPU resources and rendering pipelines
 struct RenderState {
@@ -54,6 +56,7 @@ struct BufferManager {
     textures_dirty: bool,
     texture_data_dirty: bool,
 }
+
 
 /// Scene geometry and camera
 struct SceneState {
@@ -431,6 +434,7 @@ impl BufferManager {
             mapped_at_creation: false,
         });
         
+        // Create initial triangle buffer
         let triangles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Triangles Buffer"),
             size: (std::mem::size_of::<Triangle>() * triangles_capacity) as u64,
@@ -487,6 +491,7 @@ impl BufferManager {
             texture_data_dirty: true,
         }
     }
+    
 
     /// Update spheres buffer with new data, resizing if necessary
     fn update_spheres(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, spheres: &[Sphere]) -> bool {
@@ -523,7 +528,7 @@ impl BufferManager {
         let needs_resize = triangles.len() > self.triangles_capacity;
         
         if needs_resize {
-            // Double the capacity to accommodate growth
+            // Resize to accommodate the actual triangle count
             self.triangles_capacity = (triangles.len() * 2).max(RaytracerConfig::DEFAULT_MAX_TRIANGLES);
             
             self.triangles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -533,7 +538,9 @@ impl BufferManager {
                 mapped_at_creation: false,
             });
             
-            println!("Resized triangles buffer to capacity: {}", self.triangles_capacity);
+            println!("Resized triangles buffer to capacity: {} triangles ({:.2} MB)", 
+                     self.triangles_capacity,
+                     (std::mem::size_of::<Triangle>() * self.triangles_capacity) as f64 / (1024.0 * 1024.0));
         }
         
         if self.triangles_dirty || needs_resize {
@@ -1059,10 +1066,10 @@ impl State {
         if spheres_resized || triangles_resized || materials_resized || lights_resized || textures_resized || texture_data_resized {
             self.recreate_bind_groups();
         }
-        
+
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Parallel Compute Pass"),
+                label: Some("Compute Pass"),
             });
 
             compute_pass.set_pipeline(&self.render.compute_pipeline);
@@ -1086,7 +1093,7 @@ impl State {
                     self.performance.start_time.elapsed().as_secs_f32(),
                     self.scene.camera,
                     self.scene.spheres.len() as u32,
-                    self.scene.triangles.len() as u32,
+                    self.scene.triangles.len() as u32, // All triangles accessible
                     self.scene.materials.len() as u32,
                     self.scene.lights.len() as u32,
                     [tile_offset_x, tile_offset_y],
@@ -1234,6 +1241,7 @@ impl State {
 }
 
 fn main() {
+    assert!(mem::size_of::<PushConstants>() <= 128, "Push constant must be smaller than 128 bytes (as per Vulkan spec)");
     pollster::block_on(run());
 }
 

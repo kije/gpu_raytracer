@@ -9,6 +9,6 @@ crate-type = [ "dylib"]
 
 [dependencies]
 spirv-std = { version = "0.9" }
-glam = { version = "0.29", default-features = false, features = ["libm"] }
+glam = { version = "0.29", default-features = false, features = ["libm", "bytemuck"] }
 bytemuck = { version = "1.19", features = ["derive"] }
 raytracer-shared = { path = "../shared", features = ["shader"] }
