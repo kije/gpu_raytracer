@@ -31,11 +31,13 @@ pub fn main_cs(
     #[spirv(global_invocation_id)] id: spirv_std::glam::UVec3,
     #[spirv(descriptor_set = 0, binding = 0)] output_image: &spirv_std::image::Image!(2D, format=rgba8, write),
     #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] spheres: &[Sphere],
-    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] triangles: &[Triangle],
-    #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] materials: &[Material],
-    #[spirv(descriptor_set = 0, binding = 4, storage_buffer)] lights: &[Light],
-    #[spirv(descriptor_set = 0, binding = 5, storage_buffer)] _textures: &[TextureInfo],
-    #[spirv(descriptor_set = 0, binding = 6, storage_buffer)] _texture_data: &[u32],
+    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] triangles_buffer_0: &[Triangle],
+    #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] triangles_buffer_1: &[Triangle],
+    #[spirv(descriptor_set = 0, binding = 4, storage_buffer)] triangles_buffer_2: &[Triangle],
+    #[spirv(descriptor_set = 0, binding = 5, storage_buffer)] materials: &[Material],
+    #[spirv(descriptor_set = 0, binding = 6, storage_buffer)] lights: &[Light],
+    #[spirv(descriptor_set = 0, binding = 7, storage_buffer)] _textures: &[TextureInfo],
+    #[spirv(descriptor_set = 0, binding = 8, storage_buffer)] _texture_data: &[u32],
     #[spirv(push_constant)] push_constants: &PushConstants,
 ) {
     // Calculate global pixel coordinates from tile offset and local thread id
@@ -75,8 +77,8 @@ pub fn main_cs(
     // Calculate ray direction
     let ray_direction = forward + right * camera_x + true_up * camera_y;
     let ray_direction_normalized = ray_direction.normalize();
-    
-    
+
+
     // BRANCHLESS
     // Raytracing - find closest intersection (spheres and triangles)
     let mut color = vec3(0.0, 0.0, 0.0); // Sky color
@@ -133,94 +135,161 @@ pub fn main_cs(
     //     let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);
     //     let v1 = vec3(triangle.v1[0], triangle.v1[1], triangle.v1[2]);
     //     let v2 = vec3(triangle.v2[0], triangle.v2[1], triangle.v2[2]);
-    // 
+    //
     //     // Möller-Trumbore ray-triangle intersection
     //     let edge1 = v1 - v0;
     //     let edge2 = v2 - v0;
     //     let h = ray_direction_normalized.cross(edge2);
     //     let a = edge1.dot(h);
-    // 
+    //
     //     // If a is too small, ray is parallel to triangle
     //     let a_abs = a.abs();
     //     let epsilon = RaytracerConfig::MIN_RAY_DISTANCE;
     //     let a_invalid = a_abs < epsilon;
-    // 
-    // 
+    //
+    //
     //     let f = 1.0 / a;
     //     let s = camera_pos - v0;
     //     let u = f * s.dot(h);
-    // 
+    //
     //     let u_invalid = (u < 0.0 || u > 1.0);
-    // 
+    //
     //     let q = s.cross(edge1);
     //     let v = f * ray_direction_normalized.dot(q);
-    // 
+    //
     //     let uv_invalid =  (v < 0.0) || ((u + v) > 1.0);
-    // 
-    // 
-    // 
+    //
+    //
+    //
     //     let t = f * edge2.dot(q);
-    // 
+    //
     //     let valid = !uv_invalid && !u_invalid && !a_invalid && (t > RaytracerConfig::MIN_RAY_DISTANCE) && (t < closest_t);
-    // 
+    //
     //     let (new_t, new_t_valid) = branchless_float_if!(valid, t, closest_t);
     //     let new_material_id = branchless_u32_if!(valid, triangle.material_id, hit_material_id);
     //     let (new_hit_point, new_hit_point_valid) = branchless_vec3_if!(valid, camera_pos + ray_direction_normalized * t, hit_point);
     //     let (new_hit_normal, new_hit_normal_valid) = branchless_vec3_if!(valid, (edge1.cross(edge2).normalize()), hit_normal);
-    // 
-    // 
+    //
+    //
     //     let new_is_valid = valid && new_t_valid && new_hit_point_valid && new_hit_normal_valid;
     //     closest_t = branchless_float_if!(new_is_valid, new_t, closest_t).0;
     //     hit_material_id = branchless_u32_if!(new_is_valid, new_material_id, hit_material_id);
     //     hit_point = branchless_vec3_if!(new_is_valid, new_hit_point, hit_point).0;
     //     hit_normal = branchless_vec3_if!(new_is_valid, new_hit_normal, hit_normal).0;
     // }
-    // fixme: try to implement this brancheless as well
-    // Test triangle intersections using Möller-Trumbore algorithm
+    // Virtual triangle access function - treats multiple buffers as single logical array
+    let get_triangle = |triangle_index: u32| -> Option<Triangle> {
+        if triangle_index >= push_constants.triangle_count {
+            return None;
+        }
+
+        // Calculate which buffer and local index
+        let buffer_index = triangle_index / push_constants.triangles_per_buffer;
+        let local_index = (triangle_index % push_constants.triangles_per_buffer) as usize;
+
+        // Access the appropriate buffer
+        match buffer_index {
+            0 => {
+                if local_index < triangles_buffer_0.len() {
+                    Some(triangles_buffer_0[local_index])
+                } else {
+                    None
+                }
+            }
+            1 => {
+                if local_index < triangles_buffer_1.len() {
+                    Some(triangles_buffer_1[local_index])
+                } else {
+                    None
+                }
+            }
+            2 => {
+                if local_index < triangles_buffer_2.len() {
+                    Some(triangles_buffer_2[local_index])
+                } else {
+                    None
+                }
+            }
+            _ => None, // More than 4 buffers not supported in this implementation
+        }
+    };
+
+    // Test triangle intersections using Möller-Trumbore algorithm across all buffers
     for i in 0..push_constants.triangle_count {
-        if i >= triangles.len() as u32 {
-            break;
+        if i >= push_constants.triangle_count {
+           continue;
         }
+
+        // Calculate which buffer and local index
+        let buffer_index = i / push_constants.triangles_per_buffer;
+        let local_index = (i % push_constants.triangles_per_buffer) as usize;
+
+        let triangle = match buffer_index {
+            0 => {
+                if local_index < triangles_buffer_0.len() {
+                    triangles_buffer_0[local_index]
+                } else {
+                    continue;
+                }
+            }
+            1 => {
+                if local_index < triangles_buffer_1.len() {
+                    triangles_buffer_1[local_index]
+                } else {
+                    continue;
+                }
+            }
+            2 => {
+                if local_index < triangles_buffer_2.len() {
+                    triangles_buffer_2[local_index]
+                } else {
+                    continue;
+                }
+            }
+            _ => continue // More than 4 buffers not supported in this implementation
+        };
+
+
+
+            let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);
+            let v1 = vec3(triangle.v1[0], triangle.v1[1], triangle.v1[2]);
+            let v2 = vec3(triangle.v2[0], triangle.v2[1], triangle.v2[2]);
+
+            // Möller-Trumbore ray-triangle intersection
+            let edge1 = v1 - v0;
+            let edge2 = v2 - v0;
+            let h = ray_direction_normalized.cross(edge2);
+            let a = edge1.dot(h);
+
+            // If a is too small, ray is parallel to triangle
+            if a.abs() < RaytracerConfig::MIN_RAY_DISTANCE {
+                continue;
+            }
+
+            let f = 1.0 / a;
+            let s = camera_pos - v0;
+            let u = f * s.dot(h);
+
+            if u < 0.0 || u > 1.0 {
+                continue;
+            }
+
+            let q = s.cross(edge1);
+            let v = f * ray_direction_normalized.dot(q);
+
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+
+            let t = f * edge2.dot(q);
+
+            if t > RaytracerConfig::MIN_RAY_DISTANCE && t < closest_t {
+                closest_t = t;
+                hit_material_id = triangle.material_id;
+                hit_point = camera_pos + ray_direction_normalized * t;
+                hit_normal = edge1.cross(edge2).normalize();
+            }
         
-        let triangle = triangles[i as usize];
-        let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);
-        let v1 = vec3(triangle.v1[0], triangle.v1[1], triangle.v1[2]);
-        let v2 = vec3(triangle.v2[0], triangle.v2[1], triangle.v2[2]);
-        
-        // Möller-Trumbore ray-triangle intersection
-        let edge1 = v1 - v0;
-        let edge2 = v2 - v0;
-        let h = ray_direction_normalized.cross(edge2);
-        let a = edge1.dot(h);
-        
-        // If a is too small, ray is parallel to triangle
-        if a.abs() < RaytracerConfig::MIN_RAY_DISTANCE {
-            continue;
-        }
-        
-        let f = 1.0 / a;
-        let s = camera_pos - v0;
-        let u = f * s.dot(h);
-        
-        if u < 0.0 || u > 1.0 {
-            continue;
-        }
-        
-        let q = s.cross(edge1);
-        let v = f * ray_direction_normalized.dot(q);
-        
-        if v < 0.0 || u + v > 1.0 {
-            continue;
-        }
-        
-        let t = f * edge2.dot(q);
-        
-        if t > RaytracerConfig::MIN_RAY_DISTANCE && t < closest_t {
-            closest_t = t;
-            hit_material_id = triangle.material_id;
-            hit_point = camera_pos + ray_direction_normalized * t;
-            hit_normal = edge1.cross(edge2).normalize();
-        }
     }
 
     

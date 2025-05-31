@@ -10,7 +10,7 @@ use bytemuck::{Pod, Zeroable};
 pub struct RaytracerConfig;
 
 impl RaytracerConfig {
-    pub const TILE_SIZE: u32 = 64;
+    pub const TILE_SIZE: u32 = 128;
     pub const THREAD_GROUP_SIZE: (u32, u32) = (16, 16);
     pub const DEFAULT_MAX_SPHERES: usize = 64;
     pub const DEFAULT_MAX_TRIANGLES: usize = 64;
@@ -124,7 +124,7 @@ pub struct PushConstants {
     pub tile_offset: [u32; 2],
     pub tile_size: [u32; 2],
     pub total_tiles: [u32; 2],
-    pub _padding: u32, // Keep 16-byte alignment
+    pub triangles_per_buffer: u32, // Triangles per buffer for multi-buffer access
 }
 
 impl Camera {
@@ -342,6 +342,7 @@ impl PushConstants {
         tile_offset: [u32; 2],
         tile_size: [u32; 2],
         total_tiles: [u32; 2],
+        triangles_per_buffer: u32,
     ) -> Self {
         Self {
             resolution,
@@ -354,7 +355,7 @@ impl PushConstants {
             tile_offset,
             tile_size,
             total_tiles,
-            _padding: 0,
+            triangles_per_buffer,
         }
     }
 }
@@ -375,7 +376,7 @@ impl TileHelper {
     pub fn calculate_tiles_per_frame(total_tiles: u32) -> u32 {
         match total_tiles {
             0..=16 => total_tiles,        // Render all at once for small images
-            17..=64 => 4,                 // Very conservative for medium images  
+            17..=64 => 8,                 // Very conservative for medium images  
             65..=256 => 2,                // Ultra conservative for larger images
             257..=1024 => 1,              // Single tile per frame for very large images
             _ => 1,                       // Absolute minimum for huge images

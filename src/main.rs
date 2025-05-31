@@ -38,13 +38,14 @@ struct RenderState {
 /// Smart buffer management for geometry data
 struct BufferManager {
     spheres_buffer: wgpu::Buffer,
-    triangles_buffer: wgpu::Buffer,
+    triangle_buffers: Vec<wgpu::Buffer>,
     materials_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     textures_buffer: wgpu::Buffer,
     texture_data_buffer: wgpu::Buffer,
     spheres_capacity: usize,
-    triangles_capacity: usize,
+    triangles_per_buffer: usize,
+    total_triangles_capacity: usize,
     materials_capacity: usize,
     lights_capacity: usize,
     textures_capacity: usize,
@@ -256,6 +257,26 @@ impl RenderState {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -380,6 +401,14 @@ impl RenderState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource:dummy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: dummy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: dummy_buffer.as_entire_binding(),
                 },
             ],
@@ -419,9 +448,21 @@ impl RenderState {
 }
 
 impl BufferManager {
+    /// Calculate maximum triangles per buffer based on WGPU buffer size limit
+    fn max_triangles_per_buffer() -> usize {
+        const MAX_BUFFER_SIZE: usize = 128 * 1024 * 1024; // 128MB limit
+        const TRIANGLE_SIZE: usize = std::mem::size_of::<Triangle>();
+        MAX_BUFFER_SIZE / TRIANGLE_SIZE
+    }
+    
+    /// Get triangle buffer by index, or the first buffer if index is out of bounds
+    fn get_triangle_buffer(&self, index: usize) -> &wgpu::Buffer {
+        self.triangle_buffers.get(index).unwrap_or(&self.triangle_buffers[0])
+    }
+
     fn new(device: &wgpu::Device) -> Self {
         let spheres_capacity = RaytracerConfig::DEFAULT_MAX_SPHERES;
-        let triangles_capacity = RaytracerConfig::DEFAULT_MAX_TRIANGLES;
+        let triangles_per_buffer = Self::max_triangles_per_buffer();
         let materials_capacity = 64; // Default materials capacity
         let lights_capacity = 32; // Default lights capacity
         let textures_capacity = 64; // Default textures capacity
@@ -434,13 +475,14 @@ impl BufferManager {
             mapped_at_creation: false,
         });
         
-        // Create initial triangle buffer
-        let triangles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Triangles Buffer"),
-            size: (std::mem::size_of::<Triangle>() * triangles_capacity) as u64,
+        // Create initial triangle buffer (one buffer for small scenes)
+        let triangle_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Triangle Buffer 0"),
+            size: (std::mem::size_of::<Triangle>() * triangles_per_buffer) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let triangle_buffers = vec![triangle_buffer];
         
         let materials_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Materials Buffer"),
@@ -472,13 +514,14 @@ impl BufferManager {
 
         Self {
             spheres_buffer,
-            triangles_buffer,
+            triangle_buffers,
             materials_buffer,
             lights_buffer,
             textures_buffer,
             texture_data_buffer,
             spheres_capacity,
-            triangles_capacity,
+            triangles_per_buffer,
+            total_triangles_capacity: triangles_per_buffer,
             materials_capacity,
             lights_capacity,
             textures_capacity,
@@ -523,32 +566,55 @@ impl BufferManager {
         needs_resize
     }
 
-    /// Update triangles buffer with new data, resizing if necessary
+    /// Update triangles buffers with new data, creating additional buffers if necessary
     fn update_triangles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, triangles: &[Triangle]) -> bool {
-        let needs_resize = triangles.len() > self.triangles_capacity;
+        let triangles_needed = triangles.len();
+        let buffers_needed = (triangles_needed + self.triangles_per_buffer - 1) / self.triangles_per_buffer;
+        let buffers_needed = buffers_needed.max(1); // Always need at least one buffer
         
-        if needs_resize {
-            // Resize to accommodate the actual triangle count
-            self.triangles_capacity = (triangles.len() * 2).max(RaytracerConfig::DEFAULT_MAX_TRIANGLES);
-            
-            self.triangles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Triangles Buffer"),
-                size: (std::mem::size_of::<Triangle>() * self.triangles_capacity) as u64,
+        let mut needs_resize = false;
+        
+        // Create additional triangle buffers if needed
+        while self.triangle_buffers.len() < buffers_needed {
+            let buffer_index = self.triangle_buffers.len();
+            let triangle_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Triangle Buffer {}", buffer_index)),
+                size: (std::mem::size_of::<Triangle>() * self.triangles_per_buffer) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.triangle_buffers.push(triangle_buffer);
+            self.total_triangles_capacity += self.triangles_per_buffer;
+            needs_resize = true;
             
-            println!("Resized triangles buffer to capacity: {} triangles ({:.2} MB)", 
-                     self.triangles_capacity,
-                     (std::mem::size_of::<Triangle>() * self.triangles_capacity) as f64 / (1024.0 * 1024.0));
+            println!("Created triangle buffer {}: {} triangles ({:.2} MB)", 
+                     buffer_index,
+                     self.triangles_per_buffer,
+                     (std::mem::size_of::<Triangle>() * self.triangles_per_buffer) as f64 / (1024.0 * 1024.0));
         }
         
+        if needs_resize {
+            println!("Triangle buffer system: {} buffers, total capacity: {} triangles ({:.2} MB)",
+                     self.triangle_buffers.len(),
+                     self.total_triangles_capacity,
+                     (std::mem::size_of::<Triangle>() * self.total_triangles_capacity) as f64 / (1024.0 * 1024.0));
+        }
+        
+        // Distribute triangles across buffers if dirty or resized
         if self.triangles_dirty || needs_resize {
-            queue.write_buffer(
-                &self.triangles_buffer,
-                0,
-                bytemuck::cast_slice(triangles),
-            );
+            for (buffer_index, buffer) in self.triangle_buffers.iter().enumerate() {
+                let start_triangle = buffer_index * self.triangles_per_buffer;
+                let end_triangle = std::cmp::min(start_triangle + self.triangles_per_buffer, triangles.len());
+                
+                if start_triangle < triangles.len() {
+                    let buffer_triangles = &triangles[start_triangle..end_triangle];
+                    queue.write_buffer(
+                        buffer,
+                        0,
+                        bytemuck::cast_slice(buffer_triangles),
+                    );
+                }
+            }
             self.triangles_dirty = false;
         }
         
@@ -885,22 +951,30 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: buffers.triangles_buffer.as_entire_binding(),
+                    resource: buffers.get_triangle_buffer(0).as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: buffers.materials_buffer.as_entire_binding(),
+                    resource: buffers.get_triangle_buffer(1).as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: buffers.lights_buffer.as_entire_binding(),
+                    resource: buffers.get_triangle_buffer(2).as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: buffers.textures_buffer.as_entire_binding(),
+                    resource: buffers.materials_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource: buffers.lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: buffers.texture_data_buffer.as_entire_binding(),
                 },
             ],
@@ -971,26 +1045,34 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.buffers.spheres_buffer.as_entire_binding(),
+                    resource:self. buffers.spheres_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.buffers.triangles_buffer.as_entire_binding(),
+                    resource: self.buffers.get_triangle_buffer(0).as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.buffers.materials_buffer.as_entire_binding(),
+                    resource: self.buffers.get_triangle_buffer(1).as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: self.buffers.lights_buffer.as_entire_binding(),
+                    resource: self.buffers.get_triangle_buffer(2).as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: self.buffers.textures_buffer.as_entire_binding(),
+                    resource: self.buffers.materials_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource: self.buffers.lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: self.buffers.texture_data_buffer.as_entire_binding(),
                 },
             ],
@@ -1099,6 +1181,7 @@ impl State {
                     [tile_offset_x, tile_offset_y],
                     [actual_tile_width, actual_tile_height],
                     [self.progressive.tiles_x, self.progressive.tiles_y],
+                    self.buffers.triangles_per_buffer as u32,
                 );
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 
