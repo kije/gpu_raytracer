@@ -110,6 +110,41 @@ pub struct Triangle {
     pub _padding3: [f32; 3], // Padding for alignment
 }
 
+/// Axis-Aligned Bounding Box for BVH
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct Aabb {
+    pub min: [f32; 3],      // Minimum bounds
+    pub _padding0: f32,     // Padding for alignment
+    pub max: [f32; 3],      // Maximum bounds
+    pub _padding1: f32,     // Padding for alignment
+}
+
+/// BVH Node for triangle acceleration structure
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct BvhNode {
+    pub bounds: Aabb,       // Bounding box of this node
+    pub left_child: u32,    // Index to left child (0xFFFFFFFF if leaf)
+    pub right_child: u32,   // Index to right child (0xFFFFFFFF if leaf)  
+    pub triangle_start: u32, // Starting index in triangle buffer (if leaf)
+    pub triangle_count: u32, // Number of triangles (if leaf)
+}
+
+/// Scene metadata offsets for combined buffer layout
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct SceneMetadataOffsets {
+    pub spheres_offset: u32,       // Offset to spheres data (in u32 units)
+    pub spheres_count: u32,        // Number of spheres
+    pub lights_offset: u32,        // Offset to lights data (in u32 units)
+    pub lights_count: u32,         // Number of lights
+    pub bvh_nodes_offset: u32,     // Offset to BVH nodes data (in u32 units)
+    pub bvh_nodes_count: u32,      // Number of BVH nodes
+    pub triangle_indices_offset: u32, // Offset to triangle indices (in u32 units)
+    pub triangle_indices_count: u32,  // Number of triangle indices
+}
+
 /// Push constants for compute shader
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -117,14 +152,14 @@ pub struct PushConstants {
     pub resolution: [f32; 2],
     pub time: f32,
     pub camera: Camera,
-    pub sphere_count: u32,
     pub triangle_count: u32,
     pub material_count: u32,
-    pub lights_count: u32,
     pub tile_offset: [u32; 2],
     pub tile_size: [u32; 2],
     pub total_tiles: [u32; 2],
     pub triangles_per_buffer: u32, // Triangles per buffer for multi-buffer access
+    pub metadata_offsets: SceneMetadataOffsets, // Combined scene metadata offsets
+    pub _padding: [u32; 2],        // Padding for alignment
 }
 
 impl Camera {
@@ -327,6 +362,126 @@ impl Triangle {
             _padding3: [0.0; 3],
         }
     }
+    
+    /// Calculate the bounding box of this triangle
+    pub fn bounding_box(&self) -> Aabb {
+        let min_x = self.v0[0].min(self.v1[0]).min(self.v2[0]);
+        let min_y = self.v0[1].min(self.v1[1]).min(self.v2[1]);
+        let min_z = self.v0[2].min(self.v1[2]).min(self.v2[2]);
+        
+        let max_x = self.v0[0].max(self.v1[0]).max(self.v2[0]);
+        let max_y = self.v0[1].max(self.v1[1]).max(self.v2[1]);
+        let max_z = self.v0[2].max(self.v1[2]).max(self.v2[2]);
+        
+        Aabb::new([min_x, min_y, min_z], [max_x, max_y, max_z])
+    }
+}
+
+impl Aabb {
+    /// Create a new AABB
+    pub fn new(min: [f32; 3], max: [f32; 3]) -> Self {
+        Self {
+            min,
+            _padding0: 0.0,
+            max,
+            _padding1: 0.0,
+        }
+    }
+    
+    /// Create an empty AABB
+    pub fn empty() -> Self {
+        Self::new(
+            [f32::INFINITY; 3],
+            [f32::NEG_INFINITY; 3],
+        )
+    }
+    
+    /// Combine this AABB with another
+    pub fn union(&self, other: &Aabb) -> Aabb {
+        Aabb::new(
+            [
+                self.min[0].min(other.min[0]),
+                self.min[1].min(other.min[1]),
+                self.min[2].min(other.min[2]),
+            ],
+            [
+                self.max[0].max(other.max[0]),
+                self.max[1].max(other.max[1]),
+                self.max[2].max(other.max[2]),
+            ],
+        )
+    }
+    
+    /// Get the center point of the AABB
+    pub fn center(&self) -> [f32; 3] {
+        [
+            (self.min[0] + self.max[0]) * 0.5,
+            (self.min[1] + self.max[1]) * 0.5,
+            (self.min[2] + self.max[2]) * 0.5,
+        ]
+    }
+    
+    /// Get the surface area of the AABB
+    pub fn surface_area(&self) -> f32 {
+        let dx = self.max[0] - self.min[0];
+        let dy = self.max[1] - self.min[1];
+        let dz = self.max[2] - self.min[2];
+        2.0 * (dx * dy + dy * dz + dz * dx)
+    }
+}
+
+impl BvhNode {
+    /// Create a new leaf node
+    pub fn leaf(bounds: Aabb, triangle_start: u32, triangle_count: u32) -> Self {
+        Self {
+            bounds,
+            left_child: u32::MAX,
+            right_child: u32::MAX,
+            triangle_start,
+            triangle_count,
+        }
+    }
+    
+    /// Create a new internal node
+    pub fn internal(bounds: Aabb, left_child: u32, right_child: u32) -> Self {
+        Self {
+            bounds,
+            left_child,
+            right_child,
+            triangle_start: 0,
+            triangle_count: 0,
+        }
+    }
+    
+    /// Check if this node is a leaf
+    pub fn is_leaf(&self) -> bool {
+        self.left_child == u32::MAX && self.right_child == u32::MAX
+    }
+}
+
+impl SceneMetadataOffsets {
+    /// Create new scene metadata offsets
+    pub fn new(
+        spheres_offset: u32,
+        spheres_count: u32,
+        lights_offset: u32,
+        lights_count: u32,
+        bvh_nodes_offset: u32,
+        bvh_nodes_count: u32,
+        triangle_indices_offset: u32,
+        triangle_indices_count: u32,
+    ) -> Self {
+        Self {
+            spheres_offset,
+            spheres_count,
+            lights_offset,
+            lights_count,
+            bvh_nodes_offset,
+            bvh_nodes_count,
+            triangle_indices_offset,
+            triangle_indices_count,
+        }
+    }
 }
 
 impl PushConstants {
@@ -335,27 +490,26 @@ impl PushConstants {
         resolution: [f32; 2],
         time: f32,
         camera: Camera,
-        sphere_count: u32,
         triangle_count: u32,
         material_count: u32,
-        lights_count: u32,
         tile_offset: [u32; 2],
         tile_size: [u32; 2],
         total_tiles: [u32; 2],
         triangles_per_buffer: u32,
+        metadata_offsets: SceneMetadataOffsets,
     ) -> Self {
         Self {
             resolution,
             time,
             camera,
-            sphere_count,
             triangle_count,
             material_count,
-            lights_count,
             tile_offset,
             tile_size,
             total_tiles,
             triangles_per_buffer,
+            metadata_offsets,
+            _padding: [0; 2],
         }
     }
 }
@@ -417,7 +571,7 @@ impl SceneBuilder {
         self
     }
     
-    pub fn build_default_scene() -> (Vec<Sphere>, Vec<Triangle>, Vec<Material>) {
+    pub fn build_default_scene() -> (Vec<Sphere>, Vec<Triangle>, Vec<Material>, Vec<Light>) {
         use alloc::vec;
         
         // Create materials
@@ -452,7 +606,11 @@ impl SceneBuilder {
             ),
         ];
         
-        (spheres, triangles, materials)
+        let lights = vec![
+            Light::point([5.0, 7.0, 4.0], [1.0,1.0,1.0] ,1.0, f32::INFINITY) // White light
+        ];
+        
+        (spheres, triangles, materials, lights)
     }
     
     pub fn build(self) -> (Vec<Sphere>, Vec<Triangle>, Vec<Material>) {
@@ -532,5 +690,91 @@ mod test {
         assert_eq!(branchless_float_if!(false, f32::NAN, -1.0f32), (-1.0, true));
 
         assert_eq!(branchless_float_if!(false, f32::NAN, f32::NAN), (f32::MAX, false));
+    }
+
+    #[test]
+    fn test_triangle_bounding_box() {
+        let triangle = Triangle::new(
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0], 
+            [0.5, 1.0, 0.0],
+            0
+        );
+        
+        let bbox = triangle.bounding_box();
+        assert_eq!(bbox.min, [0.0, 0.0, 0.0]);
+        assert_eq!(bbox.max, [1.0, 1.0, 0.0]);
+    }
+
+    #[test] 
+    fn test_aabb_union() {
+        let aabb1 = Aabb::new([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let aabb2 = Aabb::new([0.5, 0.5, 0.5], [2.0, 2.0, 2.0]);
+        
+        let union = aabb1.union(&aabb2);
+        assert_eq!(union.min, [0.0, 0.0, 0.0]);
+        assert_eq!(union.max, [2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_aabb_center() {
+        let aabb = Aabb::new([0.0, 0.0, 0.0], [2.0, 4.0, 6.0]);
+        let center = aabb.center();
+        assert_eq!(center, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_aabb_surface_area() {
+        let aabb = Aabb::new([0.0, 0.0, 0.0], [2.0, 3.0, 4.0]);
+        let surface_area = aabb.surface_area();
+        // Surface area = 2 * (2*3 + 3*4 + 4*2) = 2 * (6 + 12 + 8) = 2 * 26 = 52
+        assert_eq!(surface_area, 52.0);
+    }
+
+    #[test]
+    fn test_bvh_node_leaf() {
+        let aabb = Aabb::new([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let node = BvhNode::leaf(aabb, 0, 5);
+        
+        assert!(node.is_leaf());
+        assert_eq!(node.triangle_start, 0);
+        assert_eq!(node.triangle_count, 5);
+        assert_eq!(node.left_child, u32::MAX);
+        assert_eq!(node.right_child, u32::MAX);
+    }
+
+    #[test]
+    fn test_bvh_node_internal() {
+        let aabb = Aabb::new([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+        let node = BvhNode::internal(aabb, 1, 2);
+        
+        assert!(!node.is_leaf());
+        assert_eq!(node.left_child, 1);
+        assert_eq!(node.right_child, 2);
+        assert_eq!(node.triangle_start, 0);
+        assert_eq!(node.triangle_count, 0);
+    }
+
+    #[test]
+    fn test_push_constants_with_metadata() {
+        let camera = Camera::new();
+        let metadata = SceneMetadataOffsets::new(0, 10, 500, 2, 600, 50, 1000, 100);
+        let constants = PushConstants::new(
+            [1920.0, 1080.0],
+            0.0,
+            camera,
+            20,
+            5,
+            [0, 0],
+            [128, 128],
+            [15, 8],
+            100,
+            metadata,
+        );
+        
+        assert_eq!(constants.metadata_offsets.bvh_nodes_count, 50);
+        assert_eq!(constants.triangle_count, 20);
+        assert_eq!(constants.metadata_offsets.spheres_count, 10);
+        assert_eq!(constants.metadata_offsets.lights_count, 2);
     }
 }

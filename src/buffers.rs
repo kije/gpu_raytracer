@@ -1,25 +1,33 @@
 use bytemuck;
-use raytracer_shared::{Sphere, Triangle, Material, Light, TextureInfo, RaytracerConfig};
+use raytracer_shared::{Sphere, Triangle, Material, Light, TextureInfo, BvhNode, RaytracerConfig, SceneMetadataOffsets};
 
-/// Smart buffer management for geometry data
+/// Smart buffer management for geometry data with combined scene metadata buffer
 pub struct BufferManager {
-    pub spheres_buffer: wgpu::Buffer,
+    // Combined scene metadata buffer (spheres, lights, BVH nodes, triangle indices)
+    pub scene_metadata_buffer: wgpu::Buffer,
     pub triangle_buffers: Vec<wgpu::Buffer>,
     pub materials_buffer: wgpu::Buffer,
-    pub lights_buffer: wgpu::Buffer,
     pub textures_buffer: wgpu::Buffer,
     pub texture_data_buffer: wgpu::Buffer,
-    pub spheres_capacity: usize,
+    
+    // Buffer capacities and management
+    pub scene_metadata_capacity: usize, // Combined buffer capacity in bytes
     pub triangles_per_buffer: usize,
     pub total_triangles_capacity: usize,
     pub materials_capacity: usize,
-    pub lights_capacity: usize,
     pub textures_capacity: usize,
     pub texture_data_capacity: usize,
-    spheres_dirty: bool,
+    
+    // Individual component capacities within scene metadata buffer
+    pub spheres_capacity: usize,
+    pub lights_capacity: usize,
+    pub bvh_nodes_capacity: usize,
+    pub triangle_indices_capacity: usize,
+    
+    // Dirty tracking
+    scene_metadata_dirty: bool,
     triangles_dirty: bool,
     materials_dirty: bool,
-    lights_dirty: bool,
     textures_dirty: bool,
     texture_data_dirty: bool,
 }
@@ -39,15 +47,23 @@ impl BufferManager {
 
     pub fn new(device: &wgpu::Device) -> Self {
         let spheres_capacity = RaytracerConfig::DEFAULT_MAX_SPHERES;
+        let lights_capacity = 32; // Default lights capacity
+        let bvh_nodes_capacity = 256; // Default BVH nodes capacity
+        let triangle_indices_capacity = 1024; // Default triangle indices capacity
         let triangles_per_buffer = Self::max_triangles_per_buffer();
         let materials_capacity = 64; // Default materials capacity
-        let lights_capacity = 32; // Default lights capacity
         let textures_capacity = 64; // Default textures capacity
         let texture_data_capacity = 256 * 1024; // 1MB default texture data capacity (in u32 units)
 
-        let spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Spheres Buffer"),
-            size: (std::mem::size_of::<Sphere>() * spheres_capacity) as u64,
+        // Calculate combined scene metadata buffer size
+        let scene_metadata_capacity = spheres_capacity * std::mem::size_of::<Sphere>() +
+                                     lights_capacity * std::mem::size_of::<Light>() +
+                                     bvh_nodes_capacity * std::mem::size_of::<BvhNode>() +
+                                     triangle_indices_capacity * std::mem::size_of::<u32>();
+
+        let scene_metadata_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Scene Metadata Buffer"),
+            size: scene_metadata_capacity as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -68,13 +84,6 @@ impl BufferManager {
             mapped_at_creation: false,
         });
         
-        let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Lights Buffer"),
-            size: (std::mem::size_of::<Light>() * lights_capacity) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        
         let textures_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Textures Buffer"),
             size: (std::mem::size_of::<TextureInfo>() * textures_capacity) as u64,
@@ -90,56 +99,112 @@ impl BufferManager {
         });
 
         Self {
-            spheres_buffer,
+            scene_metadata_buffer,
             triangle_buffers,
             materials_buffer,
-            lights_buffer,
             textures_buffer,
             texture_data_buffer,
-            spheres_capacity,
+            scene_metadata_capacity,
             triangles_per_buffer,
             total_triangles_capacity: triangles_per_buffer,
             materials_capacity,
-            lights_capacity,
             textures_capacity,
             texture_data_capacity,
-            spheres_dirty: true,
+            spheres_capacity,
+            lights_capacity,
+            bvh_nodes_capacity,
+            triangle_indices_capacity,
+            scene_metadata_dirty: true,
             triangles_dirty: true,
             materials_dirty: true,
-            lights_dirty: true,
             textures_dirty: true,
             texture_data_dirty: true,
         }
     }
     
-    /// Update spheres buffer with new data, resizing if necessary
-    pub fn update_spheres(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, spheres: &[Sphere]) -> bool {
-        let needs_resize = spheres.len() > self.spheres_capacity;
+    /// Update scene metadata buffer with spheres, lights, BVH nodes, and triangle indices
+    pub fn update_scene_metadata(
+        &mut self, 
+        device: &wgpu::Device, 
+        queue: &wgpu::Queue, 
+        spheres: &[Sphere], 
+        lights: &[Light],
+        bvh_nodes: &[BvhNode], 
+        triangle_indices: &[u32]
+    ) -> (bool, SceneMetadataOffsets) {
+        let spheres_size = spheres.len() * std::mem::size_of::<Sphere>();
+        let lights_size = lights.len() * std::mem::size_of::<Light>();
+        let bvh_nodes_size = bvh_nodes.len() * std::mem::size_of::<BvhNode>();
+        let triangle_indices_size = triangle_indices.len() * std::mem::size_of::<u32>();
+        
+        let total_size = spheres_size + lights_size + bvh_nodes_size + triangle_indices_size;
+        let needs_resize = total_size > self.scene_metadata_capacity;
         
         if needs_resize {
-            // Double the capacity to accommodate growth
+            // Double the capacity to accommodate growth  
             self.spheres_capacity = (spheres.len() * 2).max(RaytracerConfig::DEFAULT_MAX_SPHERES);
+            self.lights_capacity = (lights.len() * 2).max(32);
+            self.bvh_nodes_capacity = (bvh_nodes.len() * 2).max(256);
+            self.triangle_indices_capacity = (triangle_indices.len() * 2).max(1024);
             
-            self.spheres_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Spheres Buffer"),
-                size: (std::mem::size_of::<Sphere>() * self.spheres_capacity) as u64,
+            self.scene_metadata_capacity = self.spheres_capacity * std::mem::size_of::<Sphere>() +
+                                          self.lights_capacity * std::mem::size_of::<Light>() +
+                                          self.bvh_nodes_capacity * std::mem::size_of::<BvhNode>() +
+                                          self.triangle_indices_capacity * std::mem::size_of::<u32>();
+            
+            self.scene_metadata_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Scene Metadata Combined Buffer"),
+                size: self.scene_metadata_capacity as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             
-            println!("Resized spheres buffer to capacity: {}", self.spheres_capacity);
+            println!("Resized scene metadata buffer: {} spheres, {} lights, {} BVH nodes, {} triangle indices ({:.2} MB)",
+                     self.spheres_capacity, self.lights_capacity, self.bvh_nodes_capacity, self.triangle_indices_capacity,
+                     self.scene_metadata_capacity as f64 / (1024.0 * 1024.0));
         }
         
-        if self.spheres_dirty || needs_resize {
+        if self.scene_metadata_dirty || needs_resize {
+            let mut combined_data = Vec::new();
+            let mut offset_in_bytes = 0;
+            
+            // Track offsets in u32 units for shader access
+            let spheres_offset_u32 = offset_in_bytes / 4;
+            combined_data.extend_from_slice(bytemuck::cast_slice(spheres));
+            offset_in_bytes += spheres_size;
+            
+            let lights_offset_u32 = offset_in_bytes / 4;
+            combined_data.extend_from_slice(bytemuck::cast_slice(lights));
+            offset_in_bytes += lights_size;
+            
+            let bvh_nodes_offset_u32 = offset_in_bytes / 4;
+            combined_data.extend_from_slice(bytemuck::cast_slice(bvh_nodes));
+            offset_in_bytes += bvh_nodes_size;
+            
+            let triangle_indices_offset_u32 = offset_in_bytes / 4;
+            combined_data.extend_from_slice(bytemuck::cast_slice(triangle_indices));
+            
             queue.write_buffer(
-                &self.spheres_buffer,
+                &self.scene_metadata_buffer,
                 0,
-                bytemuck::cast_slice(spheres),
+                &combined_data,
             );
-            self.spheres_dirty = false;
+            
+            self.scene_metadata_dirty = false;
         }
         
-        needs_resize
+        let offsets = SceneMetadataOffsets::new(
+            (0) as u32, // spheres always start at offset 0
+            spheres.len() as u32,
+            (spheres_size / 4) as u32, // lights offset in u32 units
+            lights.len() as u32,
+            ((spheres_size + lights_size) / 4) as u32, // BVH nodes offset in u32 units
+            bvh_nodes.len() as u32,
+            ((spheres_size + lights_size + bvh_nodes_size) / 4) as u32, // triangle indices offset in u32 units
+            triangle_indices.len() as u32,
+        );
+        
+        (needs_resize, offsets)
     }
 
     /// Update triangles buffers with new data, creating additional buffers if necessary
@@ -227,35 +292,6 @@ impl BufferManager {
         needs_resize
     }
 
-    /// Update lights buffer with new data, resizing if necessary
-    pub fn update_lights(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lights: &[Light]) -> bool {
-        let needs_resize = lights.len() > self.lights_capacity;
-        
-        if needs_resize {
-            // Double the capacity to accommodate growth
-            self.lights_capacity = (lights.len() * 2).max(32);
-            
-            self.lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Lights Buffer"),
-                size: (std::mem::size_of::<Light>() * self.lights_capacity) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            
-            println!("Resized lights buffer to capacity: {}", self.lights_capacity);
-        }
-        
-        if self.lights_dirty || needs_resize {
-            queue.write_buffer(
-                &self.lights_buffer,
-                0,
-                bytemuck::cast_slice(lights),
-            );
-            self.lights_dirty = false;
-        }
-        
-        needs_resize
-    }
 
     /// Update textures buffer with new data, resizing if necessary
     pub fn update_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, textures: &[TextureInfo]) -> bool {
@@ -327,9 +363,9 @@ impl BufferManager {
         needs_resize
     }
 
-    /// Mark spheres buffer as dirty (needs update)
-    pub fn mark_spheres_dirty(&mut self) {
-        self.spheres_dirty = true;
+    /// Mark scene metadata buffer as dirty (needs update)
+    pub fn mark_scene_metadata_dirty(&mut self) {
+        self.scene_metadata_dirty = true;
     }
 
     /// Mark triangles buffer as dirty (needs update)
@@ -340,11 +376,6 @@ impl BufferManager {
     /// Mark materials buffer as dirty (needs update)
     pub fn mark_materials_dirty(&mut self) {
         self.materials_dirty = true;
-    }
-
-    /// Mark lights buffer as dirty (needs update)
-    pub fn mark_lights_dirty(&mut self) {
-        self.lights_dirty = true;
     }
 
     /// Mark textures buffer as dirty (needs update)
@@ -359,7 +390,7 @@ impl BufferManager {
 
     /// Check if any buffers need updating
     pub fn needs_update(&self) -> bool {
-        self.spheres_dirty || self.triangles_dirty || self.materials_dirty || 
-        self.lights_dirty || self.textures_dirty || self.texture_data_dirty
+        self.scene_metadata_dirty || self.triangles_dirty || self.materials_dirty || 
+        self.textures_dirty || self.texture_data_dirty
     }
 }

@@ -161,7 +161,6 @@ impl RenderState {
                 wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: dummy_buffer.as_entire_binding() },
             ],
         });
 
@@ -199,7 +198,7 @@ impl RenderState {
     }
 
     fn create_pipelines(device: &wgpu::Device, shader_module: &wgpu::ShaderModule) -> (wgpu::ComputePipeline, wgpu::RenderPipeline) {
-        // Create bind group layouts
+        // Create bind group layouts (8 total bindings: 1 texture + 7 storage buffers)
         let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Compute Bind Group Layout"),
             entries: &[
@@ -213,6 +212,7 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 1: Scene metadata buffer (spheres, lights, BVH nodes, triangle indices)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -223,6 +223,7 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 2: Triangle buffer 0
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -233,6 +234,7 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 3: Triangle buffer 1
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -243,6 +245,7 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 4: Triangle buffer 2
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -253,6 +256,7 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 5: Materials buffer
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -263,6 +267,7 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 6: Textures buffer
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -273,18 +278,9 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 7: Texture data buffer
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -420,7 +416,7 @@ impl RenderState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: buffers.spheres_buffer.as_entire_binding(),
+                    resource: buffers.scene_metadata_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -440,14 +436,10 @@ impl RenderState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: buffers.lights_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
                     resource: buffers.textures_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 8,
+                    binding: 7,
                     resource: buffers.texture_data_buffer.as_entire_binding(),
                 },
             ],

@@ -3,7 +3,8 @@
 use spirv_std::spirv;
 use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec4, UVec2, Vec3};
 use spirv_std::num_traits::Float;
-use raytracer_shared::{Sphere, Triangle, Material, Light, TextureInfo, PushConstants, RaytracerConfig, branchless_float_if, branchless_u32_if};
+use raytracer_shared::{Sphere, Triangle, Material, Light, TextureInfo, PushConstants, RaytracerConfig, BvhNode};
+
 
 macro_rules! branchless_vec3_if {
     ($condition:expr, $if_true:expr, $if_false:expr) => {
@@ -30,14 +31,13 @@ macro_rules! branchless_vec3_if {
 pub fn main_cs(
     #[spirv(global_invocation_id)] id: spirv_std::glam::UVec3,
     #[spirv(descriptor_set = 0, binding = 0)] output_image: &spirv_std::image::Image!(2D, format=rgba8, write),
-    #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] spheres: &[Sphere],
+    #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] scene_metadata: &[u32],
     #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] triangles_buffer_0: &[Triangle],
     #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] triangles_buffer_1: &[Triangle],
     #[spirv(descriptor_set = 0, binding = 4, storage_buffer)] triangles_buffer_2: &[Triangle],
     #[spirv(descriptor_set = 0, binding = 5, storage_buffer)] materials: &[Material],
-    #[spirv(descriptor_set = 0, binding = 6, storage_buffer)] lights: &[Light],
-    #[spirv(descriptor_set = 0, binding = 7, storage_buffer)] _textures: &[TextureInfo],
-    #[spirv(descriptor_set = 0, binding = 8, storage_buffer)] _texture_data: &[u32],
+    #[spirv(descriptor_set = 0, binding = 6, storage_buffer)] _textures: &[TextureInfo],
+    #[spirv(descriptor_set = 0, binding = 7, storage_buffer)] _texture_data: &[u32],
     #[spirv(push_constant)] push_constants: &PushConstants,
 ) {
     // Calculate global pixel coordinates from tile offset and local thread id
@@ -79,6 +79,144 @@ pub fn main_cs(
     let ray_direction_normalized = ray_direction.normalize();
 
 
+    // Helper functions to access combined scene metadata buffer - GPU friendly (no Option types)
+    let get_sphere_center = |sphere_index: u32| -> Vec3 {
+        let base_offset = push_constants.metadata_offsets.spheres_offset as usize;
+        let sphere_offset_u32 = base_offset + (sphere_index as usize * (core::mem::size_of::<Sphere>() / 4));
+        
+        vec3(
+            f32::from_bits(scene_metadata[sphere_offset_u32]),
+            f32::from_bits(scene_metadata[sphere_offset_u32 + 1]),
+            f32::from_bits(scene_metadata[sphere_offset_u32 + 2]),
+        )
+    };
+    
+    let get_sphere_radius = |sphere_index: u32| -> f32 {
+        let base_offset = push_constants.metadata_offsets.spheres_offset as usize;
+        let sphere_offset_u32 = base_offset + (sphere_index as usize * (core::mem::size_of::<Sphere>() / 4));
+        f32::from_bits(scene_metadata[sphere_offset_u32 + 3])
+    };
+    
+    let get_sphere_material_id = |sphere_index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.spheres_offset as usize;
+        let sphere_offset_u32 = base_offset + (sphere_index as usize * (core::mem::size_of::<Sphere>() / 4));
+        scene_metadata[sphere_offset_u32 + 4]
+    };
+    
+    let get_light_position = |light_index: u32| -> Vec3 {
+        let base_offset = push_constants.metadata_offsets.lights_offset as usize;
+        let light_offset_u32 = base_offset + (light_index as usize * (core::mem::size_of::<Light>() / 4));
+        
+        vec3(
+            f32::from_bits(scene_metadata[light_offset_u32]),
+            f32::from_bits(scene_metadata[light_offset_u32 + 1]),
+            f32::from_bits(scene_metadata[light_offset_u32 + 2]),
+        )
+    };
+    
+    let get_light_type = |light_index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.lights_offset as usize;
+        let light_offset_u32 = base_offset + (light_index as usize * (core::mem::size_of::<Light>() / 4));
+        scene_metadata[light_offset_u32 + 3]
+    };
+    
+    let get_light_color = |light_index: u32| -> Vec3 {
+        let base_offset = push_constants.metadata_offsets.lights_offset as usize;
+        let light_offset_u32 = base_offset + (light_index as usize * (core::mem::size_of::<Light>() / 4));
+        
+        vec3(
+            f32::from_bits(scene_metadata[light_offset_u32 + 4]),
+            f32::from_bits(scene_metadata[light_offset_u32 + 5]),
+            f32::from_bits(scene_metadata[light_offset_u32 + 6]),
+        )
+    };
+    
+    let get_light_intensity = |light_index: u32| -> f32 {
+        let base_offset = push_constants.metadata_offsets.lights_offset as usize;
+        let light_offset_u32 = base_offset + (light_index as usize * (core::mem::size_of::<Light>() / 4));
+        f32::from_bits(scene_metadata[light_offset_u32 + 7])
+    };
+    
+    let get_light_direction = |light_index: u32| -> Vec3 {
+        let base_offset = push_constants.metadata_offsets.lights_offset as usize;
+        let light_offset_u32 = base_offset + (light_index as usize * (core::mem::size_of::<Light>() / 4));
+        
+        vec3(
+            f32::from_bits(scene_metadata[light_offset_u32 + 8]),
+            f32::from_bits(scene_metadata[light_offset_u32 + 9]),
+            f32::from_bits(scene_metadata[light_offset_u32 + 10]),
+        )
+    };
+    
+    // BVH helper functions to access BVH nodes from scene metadata buffer
+    let get_bvh_node_bounds_min = |node_index: u32| -> Vec3 {
+        let base_offset = push_constants.metadata_offsets.bvh_nodes_offset as usize;
+        let node_offset_u32 = base_offset + (node_index as usize * (core::mem::size_of::<BvhNode>() / 4));
+        
+        vec3(
+            f32::from_bits(scene_metadata[node_offset_u32]),
+            f32::from_bits(scene_metadata[node_offset_u32 + 1]),
+            f32::from_bits(scene_metadata[node_offset_u32 + 2]),
+        )
+    };
+    
+    let get_bvh_node_bounds_max = |node_index: u32| -> Vec3 {
+        let base_offset = push_constants.metadata_offsets.bvh_nodes_offset as usize;
+        let node_offset_u32 = base_offset + (node_index as usize * (core::mem::size_of::<BvhNode>() / 4));
+        
+        vec3(
+            f32::from_bits(scene_metadata[node_offset_u32 + 4]),
+            f32::from_bits(scene_metadata[node_offset_u32 + 5]),
+            f32::from_bits(scene_metadata[node_offset_u32 + 6]),
+        )
+    };
+    
+    let get_bvh_node_left_child = |node_index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.bvh_nodes_offset as usize;
+        let node_offset_u32 = base_offset + (node_index as usize * (core::mem::size_of::<BvhNode>() / 4));
+        scene_metadata[node_offset_u32 + 8]
+    };
+    
+    let get_bvh_node_right_child = |node_index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.bvh_nodes_offset as usize;
+        let node_offset_u32 = base_offset + (node_index as usize * (core::mem::size_of::<BvhNode>() / 4));
+        scene_metadata[node_offset_u32 + 9]
+    };
+    
+    let get_bvh_node_triangle_start = |node_index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.bvh_nodes_offset as usize;
+        let node_offset_u32 = base_offset + (node_index as usize * (core::mem::size_of::<BvhNode>() / 4));
+        scene_metadata[node_offset_u32 + 10]
+    };
+    
+    let get_bvh_node_triangle_count = |node_index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.bvh_nodes_offset as usize;
+        let node_offset_u32 = base_offset + (node_index as usize * (core::mem::size_of::<BvhNode>() / 4));
+        scene_metadata[node_offset_u32 + 11]
+    };
+    
+    let get_triangle_index = |index: u32| -> u32 {
+        let base_offset = push_constants.metadata_offsets.triangle_indices_offset as usize;
+        let triangle_index_offset = base_offset + (index as usize);
+        scene_metadata[triangle_index_offset]
+    };
+    
+    // Ray-AABB intersection test for BVH traversal
+    let ray_aabb_intersect = |ray_origin: Vec3, ray_dir: Vec3, aabb_min: Vec3, aabb_max: Vec3| -> bool {
+        let inv_dir = vec3(1.0 / ray_dir.x, 1.0 / ray_dir.y, 1.0 / ray_dir.z);
+        
+        let t1 = (aabb_min - ray_origin) * inv_dir;
+        let t2 = (aabb_max - ray_origin) * inv_dir;
+        
+        let tmin = t1.min(t2);
+        let tmax = t1.max(t2);
+        
+        let tmin_max = tmin.x.max(tmin.y).max(tmin.z);
+        let tmax_min = tmax.x.min(tmax.y).min(tmax.z);
+        
+        tmax_min >= 0.0 && tmin_max <= tmax_min
+    };
+
     // BRANCHLESS
     // Raytracing - find closest intersection (spheres and triangles)
     let mut color = vec3(0.0, 0.0, 0.0); // Sky color
@@ -88,42 +226,39 @@ pub fn main_cs(
     let mut hit_point = vec3(0.0, 0.0, 0.0);
     let camera_pos = vec3(push_constants.camera.position[0], push_constants.camera.position[1], push_constants.camera.position[2]);
 
-    // Test sphere intersections - branchless version
-    for i in 0..push_constants.sphere_count {
-        let sphere_index = i as usize;
-        let sphere = spheres[sphere_index];
-        let sphere_center = vec3(sphere.center[0], sphere.center[1], sphere.center[2]);
-        let oc = camera_pos - sphere_center;
 
-        let a = ray_direction_normalized.dot(ray_direction_normalized);
-        let b = 2.0 * oc.dot(ray_direction_normalized);
-        let c = oc.dot(oc) - sphere.radius * sphere.radius;
-
-        let discriminant = b * b - 4.0 * a * c;
-
-        // Branchless intersection calculation
-        let sqrt_discriminant = discriminant.sqrt();
-        let t1 = (-b - sqrt_discriminant) / (2.0 * a);
-        let t2 = (-b + sqrt_discriminant) / (2.0 * a);
-
-        // Select closest valid t without branching
-        let t1_valid = t1 > RaytracerConfig::MIN_RAY_DISTANCE;
-        let (t, t_valid) = branchless_float_if!(t1_valid, t1, t2);
-
-        // Check if intersection is valid and closer
-        let hit_valid = (discriminant >= 0.0) && (t > RaytracerConfig::MIN_RAY_DISTANCE) && (t < closest_t) && (i < spheres.len() as u32) && t_valid;
-
-        // Branchless update of intersection data
-        let (new_t, new_t_valid) = branchless_float_if!(hit_valid, t, closest_t);
-        let new_material_id = branchless_u32_if!(hit_valid, sphere.material_id, hit_material_id);
-        let (new_hit_point, new_hit_point_valid) = branchless_vec3_if!(hit_valid, camera_pos + ray_direction_normalized * t, hit_point);
-        let (new_hit_normal, new_hit_normal_valid) = branchless_vec3_if!(hit_valid, ((new_hit_point - sphere_center).normalize()), hit_normal);
-
-        let new_is_valid = hit_valid && new_t_valid && new_hit_point_valid && new_hit_normal_valid;
-        closest_t = branchless_float_if!(new_is_valid, new_t, closest_t).0;
-        hit_material_id = branchless_u32_if!(new_is_valid,new_material_id, hit_material_id);
-        hit_point = branchless_vec3_if!(new_is_valid, new_hit_point, hit_point).0;
-        hit_normal = branchless_vec3_if!(new_is_valid, new_hit_normal, hit_normal).0;
+    // Test sphere intersections with AABB culling for acceleration
+    for i in 0..push_constants.metadata_offsets.spheres_count {
+        // Quick AABB test for sphere
+        let sphere_center = get_sphere_center(i);
+        let sphere_radius = get_sphere_radius(i);
+        let sphere_min = sphere_center - Vec3::splat(sphere_radius);
+        let sphere_max = sphere_center + Vec3::splat(sphere_radius);
+        
+        // Only test intersection if ray intersects sphere's AABB
+        if ray_aabb_intersect(camera_pos, ray_direction_normalized, sphere_min, sphere_max) {
+            // Inline sphere intersection to avoid closure return types
+            let oc = camera_pos - sphere_center;
+            let a = ray_direction_normalized.dot(ray_direction_normalized);
+            let b = 2.0 * oc.dot(ray_direction_normalized);
+            let c = oc.dot(oc) - sphere_radius * sphere_radius;
+            let discriminant = b * b - 4.0 * a * c;
+            
+            if discriminant >= 0.0 {
+                let sqrt_discriminant = discriminant.sqrt();
+                let t1 = (-b - sqrt_discriminant) / (2.0 * a);
+                let t2 = (-b + sqrt_discriminant) / (2.0 * a);
+                
+                let t = if t1 > RaytracerConfig::MIN_RAY_DISTANCE { t1 } else { t2 };
+                
+                if t > RaytracerConfig::MIN_RAY_DISTANCE && t < closest_t {
+                    closest_t = t;
+                    hit_material_id = get_sphere_material_id(i);
+                    hit_point = camera_pos + ray_direction_normalized * t;
+                    hit_normal = (hit_point - sphere_center).normalize();
+                }
+            }
+        }
     }
 
 
@@ -177,79 +312,155 @@ pub fn main_cs(
     //     hit_point = branchless_vec3_if!(new_is_valid, new_hit_point, hit_point).0;
     //     hit_normal = branchless_vec3_if!(new_is_valid, new_hit_normal, hit_normal).0;
     // }
-    // Virtual triangle access function - treats multiple buffers as single logical array
-    let get_triangle = |triangle_index: u32| -> Option<Triangle> {
-        if triangle_index >= push_constants.triangle_count {
-            return None;
+
+
+    // BVH traversal using explicit stack to avoid recursion
+    if push_constants.metadata_offsets.bvh_nodes_count > 0 {
+        // Stack for BVH traversal (GPU-friendly - fixed size)
+        let mut node_stack: [u32; 64] = [0xFFFFFFFF; 64];
+        let mut stack_ptr = 0;
+        node_stack[0] = 0; // Start with root node
+        stack_ptr += 1;
+
+        while stack_ptr > 0 {
+            stack_ptr -= 1;
+            let current_node = node_stack[stack_ptr];
+            
+            if current_node == 0xFFFFFFFF || current_node >= push_constants.metadata_offsets.bvh_nodes_count {
+                continue;
+            }
+
+            // Test current node AABB
+            let bounds_min = get_bvh_node_bounds_min(current_node);
+            let bounds_max = get_bvh_node_bounds_max(current_node);
+            
+            if !ray_aabb_intersect(camera_pos, ray_direction_normalized, bounds_min, bounds_max) {
+                continue;
+            }
+
+            // Check if leaf node
+            let left_child = get_bvh_node_left_child(current_node);
+            let right_child = get_bvh_node_right_child(current_node);
+            
+            if left_child == 0xFFFFFFFF { // Leaf node
+                let triangle_start = get_bvh_node_triangle_start(current_node);
+                let triangle_count = get_bvh_node_triangle_count(current_node);
+                
+                // Test all triangles in this leaf - inline intersection to avoid closures
+                for i in 0..triangle_count {
+                    if triangle_start + i >= push_constants.metadata_offsets.triangle_indices_count {
+                        break;
+                    }
+                    
+                    let triangle_index = get_triangle_index(triangle_start + i);
+                    let buffer_index = triangle_index / push_constants.triangles_per_buffer;
+                    let local_index = (triangle_index % push_constants.triangles_per_buffer) as usize;
+
+                    let triangle = match buffer_index {
+                        0 => {
+                            if local_index < triangles_buffer_0.len() {
+                                triangles_buffer_0[local_index]
+                            } else {
+                                continue;
+                            }
+                        }
+                        1 => {
+                            if local_index < triangles_buffer_1.len() {
+                                triangles_buffer_1[local_index]
+                            } else {
+                                continue;
+                            }
+                        }
+                        2 => {
+                            if local_index < triangles_buffer_2.len() {
+                                triangles_buffer_2[local_index]
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue
+                    };
+
+                    let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);
+                    let v1 = vec3(triangle.v1[0], triangle.v1[1], triangle.v1[2]);
+                    let v2 = vec3(triangle.v2[0], triangle.v2[1], triangle.v2[2]);
+
+                    // Möller-Trumbore ray-triangle intersection
+                    let edge1 = v1 - v0;
+                    let edge2 = v2 - v0;
+                    let h = ray_direction_normalized.cross(edge2);
+                    let a = edge1.dot(h);
+
+                    if a.abs() < RaytracerConfig::MIN_RAY_DISTANCE {
+                        continue;
+                    }
+
+                    let f = 1.0 / a;
+                    let s = camera_pos - v0;
+                    let u = f * s.dot(h);
+
+                    if u < 0.0 || u > 1.0 {
+                        continue;
+                    }
+
+                    let q = s.cross(edge1);
+                    let v = f * ray_direction_normalized.dot(q);
+
+                    if v < 0.0 || u + v > 1.0 {
+                        continue;
+                    }
+
+                    let t = f * edge2.dot(q);
+
+                    if t > RaytracerConfig::MIN_RAY_DISTANCE && t < closest_t {
+                        closest_t = t;
+                        hit_material_id = triangle.material_id;
+                        hit_point = camera_pos + ray_direction_normalized * t;
+                        hit_normal = edge1.cross(edge2).normalize();
+                    }
+                }
+            } else { // Internal node
+                // Add children to stack (right first for left-first traversal)
+                if right_child != 0xFFFFFFFF && stack_ptr < 63 {
+                    node_stack[stack_ptr] = right_child;
+                    stack_ptr += 1;
+                }
+                if left_child != 0xFFFFFFFF && stack_ptr < 63 {
+                    node_stack[stack_ptr] = left_child;
+                    stack_ptr += 1;
+                }
+            }
         }
+    } else {
+        // Fallback to brute-force if no BVH available
+        for i in 0..push_constants.triangle_count {
+            let buffer_index = i / push_constants.triangles_per_buffer;
+            let local_index = (i % push_constants.triangles_per_buffer) as usize;
 
-        // Calculate which buffer and local index
-        let buffer_index = triangle_index / push_constants.triangles_per_buffer;
-        let local_index = (triangle_index % push_constants.triangles_per_buffer) as usize;
-
-        // Access the appropriate buffer
-        match buffer_index {
-            0 => {
-                if local_index < triangles_buffer_0.len() {
-                    Some(triangles_buffer_0[local_index])
-                } else {
-                    None
+            let triangle = match buffer_index {
+                0 => {
+                    if local_index < triangles_buffer_0.len() {
+                        triangles_buffer_0[local_index]
+                    } else {
+                        continue;
+                    }
                 }
-            }
-            1 => {
-                if local_index < triangles_buffer_1.len() {
-                    Some(triangles_buffer_1[local_index])
-                } else {
-                    None
+                1 => {
+                    if local_index < triangles_buffer_1.len() {
+                        triangles_buffer_1[local_index]
+                    } else {
+                        continue;
+                    }
                 }
-            }
-            2 => {
-                if local_index < triangles_buffer_2.len() {
-                    Some(triangles_buffer_2[local_index])
-                } else {
-                    None
+                2 => {
+                    if local_index < triangles_buffer_2.len() {
+                        triangles_buffer_2[local_index]
+                    } else {
+                        continue;
+                    }
                 }
-            }
-            _ => None, // More than 4 buffers not supported in this implementation
-        }
-    };
-
-    // Test triangle intersections using Möller-Trumbore algorithm across all buffers
-    for i in 0..push_constants.triangle_count {
-        if i >= push_constants.triangle_count {
-           continue;
-        }
-
-        // Calculate which buffer and local index
-        let buffer_index = i / push_constants.triangles_per_buffer;
-        let local_index = (i % push_constants.triangles_per_buffer) as usize;
-
-        let triangle = match buffer_index {
-            0 => {
-                if local_index < triangles_buffer_0.len() {
-                    triangles_buffer_0[local_index]
-                } else {
-                    continue;
-                }
-            }
-            1 => {
-                if local_index < triangles_buffer_1.len() {
-                    triangles_buffer_1[local_index]
-                } else {
-                    continue;
-                }
-            }
-            2 => {
-                if local_index < triangles_buffer_2.len() {
-                    triangles_buffer_2[local_index]
-                } else {
-                    continue;
-                }
-            }
-            _ => continue // More than 4 buffers not supported in this implementation
-        };
-
-
+                _ => continue
+            };
 
             let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);
             let v1 = vec3(triangle.v1[0], triangle.v1[1], triangle.v1[2]);
@@ -261,7 +472,6 @@ pub fn main_cs(
             let h = ray_direction_normalized.cross(edge2);
             let a = edge1.dot(h);
 
-            // If a is too small, ray is parallel to triangle
             if a.abs() < RaytracerConfig::MIN_RAY_DISTANCE {
                 continue;
             }
@@ -289,7 +499,7 @@ pub fn main_cs(
                 hit_point = camera_pos + ray_direction_normalized * t;
                 hit_normal = edge1.cross(edge2).normalize();
             }
-        
+        }
     }
 
     
@@ -309,55 +519,53 @@ pub fn main_cs(
             let ambient = albedo * 0.1;
             total_lighting += ambient;
 
-            // Process all lights in the scene - branchless version
-            // for light_idx in 0..push_constants.lights_count {
-            //     let index_valid = (light_idx < lights.len() as u32) as u32 as f32;
-            //     let light_index = if lights.len() > 0 {
-            //         if (light_idx as usize) < lights.len() { light_idx as usize } else { lights.len() - 1 }
-            //     } else { 0 };
-            //     let light = lights[light_index];
-            // 
-            //     let light_pos = vec3(light.position[0], light.position[1], light.position[2]);
-            //     let light_dir_vec = vec3(light.direction[0], light.direction[1], light.direction[2]);
-            //     let light_color = vec3(light.color[0], light.color[1], light.color[2]);
-            // 
-            //     // Calculate directional light properties
-            //     let dir_light_dir = -light_dir_vec.normalize();
-            //     let dir_light_intensity = hit_normal.dot(dir_light_dir).max(0.0) * light.intensity;
-            // 
-            //     // Calculate point/spot light properties
-            //     let to_light = light_pos - hit_point;
-            //     let distance = to_light.length();
-            //     let point_light_dir = to_light.normalize();
-            //     let attenuation = 1.0 / (1.0 + distance * distance * 0.01);
-            //     let point_light_intensity = hit_normal.dot(point_light_dir).max(0.0) * light.intensity * attenuation;
-            // 
-            //     // Calculate spot light factor
-            //     let spot_factor = (-light_dir_vec.normalize()).dot(point_light_dir).max(0.0);
-            //     let spot_light_intensity = point_light_intensity * spot_factor;
-            // 
-            //     // Branchless light type selection using floats
-            //     let is_directional = (light.light_type == 0) as u32 as f32;
-            //     let is_point = (light.light_type == 1) as u32 as f32;
-            //     let is_spot = (light.light_type == 2) as u32 as f32;
-            // 
-            //     // Combine light calculations branchlessly
-            //     let _light_dir = dir_light_dir * is_directional + point_light_dir * (is_point + is_spot);
-            //     let light_intensity = dir_light_intensity * is_directional +
-            //                         point_light_intensity * is_point +
-            //                         spot_light_intensity * is_spot;
-            // 
-            //     // Branchless BRDF evaluation
-            //     let diffuse = albedo / core::f32::consts::PI;
-            //     let is_metallic = (material.metallic > 0.5) as u32 as f32;
-            //     let metallic_contrib = albedo * light_intensity * 0.5;
-            //     let dielectric_contrib = diffuse * light_intensity;
-            //     let light_contribution = metallic_contrib * is_metallic + dielectric_contrib * (1.0 - is_metallic);
-            // 
-            //     // Only add contribution if light intensity is positive and index is valid
-            //     let contribution_valid = ((light_intensity > 0.0) as u32 as f32) * index_valid;
-            //     total_lighting += light_contribution * light_color * contribution_valid;
-            // }
+            // Process all lights in the scene using scene metadata buffer
+            for light_idx in 0..push_constants.metadata_offsets.lights_count {
+                let index_valid = (light_idx < push_constants.metadata_offsets.lights_count) as u32 as f32;
+                
+                let light_pos = get_light_position(light_idx);
+                let light_type = get_light_type(light_idx);
+                let light_color = get_light_color(light_idx);
+                let light_intensity = get_light_intensity(light_idx);
+                let light_dir_vec = get_light_direction(light_idx);
+            
+                // Calculate directional light properties
+                let dir_light_dir = -light_dir_vec.normalize();
+                let dir_light_intensity = hit_normal.dot(dir_light_dir).max(0.0) * light_intensity;
+            
+                // Calculate point/spot light properties
+                let to_light = light_pos - hit_point;
+                let distance = to_light.length();
+                let point_light_dir = to_light.normalize();
+                let attenuation = 1.0 / (1.0 + distance * distance * 0.01);
+                let point_light_intensity = hit_normal.dot(point_light_dir).max(0.0) * light_intensity * attenuation;
+            
+                // Calculate spot light factor
+                let spot_factor = (-light_dir_vec.normalize()).dot(point_light_dir).max(0.0);
+                let spot_light_intensity = point_light_intensity * spot_factor;
+            
+                // Branchless light type selection using floats
+                let is_directional = (light_type == 0) as u32 as f32;
+                let is_point = (light_type == 1) as u32 as f32;
+                let is_spot = (light_type == 2) as u32 as f32;
+            
+                // Combine light calculations branchlessly
+                let _light_dir = dir_light_dir * is_directional + point_light_dir * (is_point + is_spot);
+                let light_intensity_final = dir_light_intensity * is_directional +
+                                           point_light_intensity * is_point +
+                                           spot_light_intensity * is_spot;
+            
+                // Branchless BRDF evaluation
+                let diffuse = albedo / core::f32::consts::PI;
+                let is_metallic = (material.metallic > 0.5) as u32 as f32;
+                let metallic_contrib = albedo * light_intensity_final * 0.5;
+                let dielectric_contrib = diffuse * light_intensity_final;
+                let light_contribution = metallic_contrib * is_metallic + dielectric_contrib * (1.0 - is_metallic);
+            
+                // Only add contribution if light intensity is positive and index is valid
+                let contribution_valid = ((light_intensity_final > 0.0) as u32 as f32) * index_valid;
+                total_lighting += light_contribution * light_color * contribution_valid;
+            }
 
             // Add emission
             color = total_lighting + emission;

@@ -17,10 +17,11 @@ The main application is now organized into focused modules for maintainability:
 - **`main.rs`**: Entry point and main event loop, coordinates between modules
 - **`renderer.rs`**: GPU pipeline setup, WGPU device management, and rendering state
 - **`scene.rs`**: Scene data management and glTF loading functionality
-- **`buffers.rs`**: Smart GPU buffer management with automatic resizing
+- **`buffers.rs`**: Smart GPU buffer management with automatic resizing and combined scene metadata buffer
 - **`compute.rs`**: Compute shader execution and progressive rendering logic
 - **`input.rs`**: Input handling and camera controls
 - **`gltf_loader.rs`**: Complete glTF 2.0 scene loading implementation
+- **`bvh.rs`**: BVH (Bounding Volume Hierarchy) acceleration structure for triangle intersection
 
 ## Build System
 
@@ -45,16 +46,19 @@ cargo run --release
 
 ## Architecture Changes (Latest)
 
-The project now uses a **progressive tile-based rendering architecture** with **PBR material system** and **comprehensive glTF 2.0 loading**:
+The project now uses a **progressive tile-based rendering architecture** with **BVH acceleration**, **PBR material system**, and **comprehensive glTF 2.0 loading**:
 
-- **Progressive Rendering**: Raytracing uses 64x64 pixel tiles processed incrementally for real-time feedback
+- **Progressive Rendering**: Raytracing uses 128x128 pixel tiles processed incrementally for real-time feedback
+- **BVH Acceleration**: Full BVH (Bounding Volume Hierarchy) implementation for fast triangle intersection
+- **Combined Scene Buffer**: Optimized GPU memory layout with single metadata buffer containing spheres, lights, BVH nodes, and triangle indices
 - **PBR Materials**: Physically-based rendering with metallic/roughness workflow, ready for Microfacet BRDF
-- **Material System**: Separate material buffer with albedo, metallic, roughness, emission, IOR, and transmission
+- **Enhanced Material System**: Extended PBR materials supporting KHR extensions (specular, volume, transmission, IOR)
 - **glTF 2.0 Support**: Complete glTF/GLB scene loading with cameras, lights, textures, and materials
 - **Compute Phase**: Raytracing runs in compute shader, writes directly to storage texture
 - **Render Phase**: Fragment shader samples the raytraced texture onto a fullscreen quad
 - **Performance**: Raytracing only re-runs when needed (window resize, user input like spacebar)
 - **Scalability**: Complex raytracing won't block the render loop
+- **Branchless GPU Code**: Optimized branchless algorithms for GPU efficiency
 - **Shared Crate**: Common data structures eliminate code duplication between main app and shader
 
 ### Pipeline Structure
@@ -80,8 +84,16 @@ The project now uses a **progressive tile-based rendering architecture** with **
 
 - **`buffers.rs`**:
   - `BufferManager`: Smart GPU buffer allocation with automatic resizing
+  - Combined scene metadata buffer optimization for GPU memory efficiency
   - Buffer dirty tracking and batch updates
   - Multi-buffer triangle system for large scenes
+  - Support for BVH nodes and triangle indices in combined buffer
+  
+- **`bvh.rs`**:
+  - `BvhBuilder`: Constructs BVH acceleration structures from triangle data
+  - `BvhTriangle`: Wrapper for triangles with BVH-specific functionality
+  - Optimized for large scenes with chunked building approach
+  - Comprehensive unit tests for BVH construction and validation
 
 - **`scene.rs`**:
   - `SceneState`: Camera, geometry, materials, lights, and textures
@@ -103,26 +115,32 @@ The project now uses a **progressive tile-based rendering architecture** with **
 - **Data flow**: Push constants (resolution, time) → Compute shader → Storage buffer → Surface texture
 
 ### Shader Interface
-- **Push constants**: `PushConstants` struct shared between host and shader for resolution/time/camera/tile/material data
+- **Push constants**: `PushConstants` struct shared between host and shader for resolution/time/camera/tile/material/metadata data
 - **Storage texture**: Direct writes to rgba8 texture for progressive tile rendering
-- **Storage buffers**: Separate buffers for spheres, triangles, materials, lights, textures, and texture data
+- **Combined Scene Metadata Buffer**: Single buffer containing spheres, lights, BVH nodes, and triangle indices with `SceneMetadataOffsets` for indexing
+- **Storage buffers**: Maximum of 8 storage buffers due to GPU limitations
 - **Bindings**: 
   - Descriptor set 0, binding 0: Storage texture (write)
-  - Descriptor set 0, binding 1: Spheres buffer (read)
-  - Descriptor set 0, binding 2: Triangles buffer (read)
-  - Descriptor set 0, binding 3: Materials buffer (read)
-  - Descriptor set 0, binding 4: Lights buffer (read)
-  - Descriptor set 0, binding 5: Textures buffer (read)
-  - Descriptor set 0, binding 6: Texture data buffer (read)
+  - Descriptor set 0, binding 1: Combined scene metadata buffer (spheres, lights, BVH, triangle indices) (read)
+  - Descriptor set 0, binding 2: Triangles buffer 0 (read)
+  - Descriptor set 0, binding 3: Triangles buffer 1 (read)
+  - Descriptor set 0, binding 4: Triangles buffer 2 (read)
+  - Descriptor set 0, binding 5: Materials buffer (read)
+  - Descriptor set 0, binding 6: Textures buffer (read)
+  - Descriptor set 0, binding 7: Texture data buffer (read)
 
 ### Shared Data Structures (`shared/` crate)
 - **Camera**: Position, direction, up vector, FOV - uses `[f32; 3]` arrays for cross-platform compatibility
-- **Material**: PBR material with albedo, metallic, roughness, emission, IOR, transmission properties
+- **Material**: Enhanced PBR material with albedo, metallic, roughness, emission, IOR, transmission, and KHR extension support
 - **Sphere**: Center, radius, material_id - references material by index
 - **Triangle**: Three vertices, material_id - triangle primitive with material reference
 - **Light**: Position, direction, color, intensity, type (directional, point, spot) - punctual lighting from glTF
 - **TextureInfo**: Width, height, format, offset - texture metadata for shader lookups
-- **PushConstants**: Resolution, time, camera, tile info, material count - all shader parameters
+- **Aabb**: Axis-aligned bounding box for BVH acceleration
+- **BvhNode**: BVH node with bounds, child indices, and triangle data for acceleration structure
+- **SceneMetadataOffsets**: Offsets for combined scene metadata buffer layout
+- **PushConstants**: Resolution, time, camera, tile info, material count, metadata offsets - all shader parameters
+- **Branchless Macros**: GPU-optimized branchless conditional operations
 - **Cross-platform compatibility**: Uses arrays instead of Vec types, works in both std and no_std environments
 
 ### Material System
@@ -154,20 +172,29 @@ The project now uses a **progressive tile-based rendering architecture** with **
 - WGPU 0.16.0 with SPIR-V support for GPU compute
 - spirv-builder for shader compilation
 - raytracer-shared workspace crate for shared data structures
+- **bvh 0.11.0** - BVH acceleration structure construction
+- **nalgebra 0.33** - Linear algebra for BVH calculations (only used because bvh crate depends on it - should not be used anywhere else)
 - Specific dependency pinning for compatibility (ahash 0.7.8, gpu-descriptor 0.2.0)
 - glam for vector math
 - bytemuck for GPU data marshalling
+- gltf 1.4 with comprehensive KHR extension support
+- image 0.24 and exr 1.5.0 for texture loading
 
 ## Shader Development
 
 The compute shader (`shader/src/lib.rs`) is a `#![no_std]` crate that:
-- Uses `spirv-std` for GPU programming primitives
+- Uses `spirv-std` from the `rust-gpu` project for GPU programming primitives
 - Imports shared data structures from `raytracer-shared` crate
 - Implements progressive tile-based raytracing with sphere and triangle intersection
+- **BVH Traversal**: Uses BVH acceleration structure for fast triangle intersection
+- **Combined Buffer Access**: Reads from combined scene metadata buffer with offset-based indexing
 - Evaluates PBR materials with simplified BRDF (ready for Microfacet BRDF upgrade)
 - Handles material types: diffuse, metallic, glass (transmission), and emissive
 - Converts array-based shared structs to Vec3 types for mathematical operations
+- **Branchless Implementation**: Extensively uses branchless algorithms for GPU efficiency
 - Defines compute (`main_cs`), vertex (`main_vs`), and fragment (`main_fs`) shader entry points
+- Code in the shader crate should, where possible, be implemented in a branchless style to fully take advantages of the GPU architecture
+- There are limitations on the GPU, e.g. there is no 8/16 bit aligned access and things like pointers and core::option:Option are not available.
 
 ## Current Demo Scene
 
@@ -180,6 +207,18 @@ The default scene showcases the material system with:
 
 ## Before implementing code
 - think carefully about the most optimal solution given the request and the project structure and state.
+
+## Before implementing code
+- review all the changes and the current code and check if there are opportunities to refactor. If there are small opportunities for refactoring, do it now. If the refactor would be large, suggest it with high-level details to the user, but don't implement it right away.
+
+## Unit tests
+- Implement unit tests for all non-trivial features and functions that test at least base functionality of the feature. Best to cover all possible cases.
+- Implement tests as in-source test blocks/modules as usual in Rust projects.
+
+## Future plans
+The following things are planned for the future. Don't implement them right away unless asked to do so. But consider it when implementing feature so they can align well with these future goals.
+
+@PLAN.md
 
 # Summary instructions
 

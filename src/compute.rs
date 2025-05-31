@@ -53,15 +53,14 @@ impl ComputeRenderer {
             });
         
         // Update geometry buffers using smart buffer management
-        let spheres_resized = buffers.update_spheres(&render.device, &render.queue, &scene.spheres);
+        let (scene_metadata_resized, metadata_offsets) = buffers.update_scene_metadata(&render.device, &render.queue, &scene.spheres, &scene.lights, &scene.bvh_nodes, &scene.triangle_indices);
         let triangles_resized = buffers.update_triangles(&render.device, &render.queue, &scene.triangles);
         let materials_resized = buffers.update_materials(&render.device, &render.queue, &scene.materials);
-        let lights_resized = buffers.update_lights(&render.device, &render.queue, &scene.lights);
         let textures_resized = buffers.update_textures(&render.device, &render.queue, &scene.textures);
         let texture_data_resized = buffers.update_texture_data(&render.device, &render.queue, &scene.texture_data);
         
         // If buffers were resized, recreate bind groups with new buffers
-        if spheres_resized || triangles_resized || materials_resized || lights_resized || textures_resized || texture_data_resized {
+        if scene_metadata_resized || triangles_resized || materials_resized || textures_resized || texture_data_resized {
             render.recreate_bind_groups(buffers);
         }
 
@@ -90,14 +89,13 @@ impl ComputeRenderer {
                     [render.size.width as f32, render.size.height as f32],
                     performance.start_time.elapsed().as_secs_f32(),
                     scene.camera,
-                    scene.spheres.len() as u32,
-                    scene.triangles.len() as u32, // All triangles accessible
+                    scene.triangles.len() as u32,
                     scene.materials.len() as u32,
-                    scene.lights.len() as u32,
                     [tile_offset_x, tile_offset_y],
                     [actual_tile_width, actual_tile_height],
                     [progressive.tiles_x, progressive.tiles_y],
                     buffers.triangles_per_buffer as u32,
+                    metadata_offsets,
                 );
                 compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 

@@ -1,4 +1,5 @@
 #![feature(build_hasher_simple_hash_one)]
+#![feature(inline_const)]
 
 use std::mem;
 use winit::{
@@ -14,6 +15,7 @@ mod renderer;
 mod scene;
 mod buffers;
 mod compute;
+mod bvh;
 
 use input::{InputState, CameraController};
 use renderer::{RenderState, ProgressiveState, PerformanceState};
@@ -115,10 +117,9 @@ impl State {
                     println!("Failed to load glTF file: {:?}", e);
                 } else {
                     self.trigger_recompute();
-                    self.buffers.mark_spheres_dirty();
+                    self.buffers.mark_scene_metadata_dirty();
                     self.buffers.mark_triangles_dirty();
                     self.buffers.mark_materials_dirty();
-                    self.buffers.mark_lights_dirty();
                     self.buffers.mark_textures_dirty();
                     self.buffers.mark_texture_data_dirty();
                 }
@@ -145,7 +146,9 @@ impl State {
 }
 
 fn main() {
-    assert!(mem::size_of::<PushConstants>() <= 128, "Push constant must be smaller than 128 bytes (as per Vulkan spec)");
+    const {
+        assert!(mem::size_of::<PushConstants>() <= 128, "Push constant must be smaller than 128 bytes (as per Vulkan spec)");
+    };
     pollster::block_on(run());
 }
 
