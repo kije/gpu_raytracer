@@ -6,9 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a GPU-accelerated (offline) raytracer written in Rust using rust-gpu and WGPU for compute shaders. The project uses a workspace structure with three main components:
 
-- **Main application** (`src/main.rs`): WGPU-based application that sets up compute pipeline, manages window/surface, and handles the main event loop
+- **Main application** (`src/`): Modular WGPU-based application with clean separation of concerns
 - **Compute shader** (`shader/`): SPIR-V compute shader written in Rust using rust-gpu's `spirv-std` for the actual raytracing calculations
 - **Shared crate** (`shared/`): Contains shared data structures used by both the main application and shader
+
+### Main Application Architecture (`src/`)
+
+The main application is now organized into focused modules for maintainability:
+
+- **`main.rs`**: Entry point and main event loop, coordinates between modules
+- **`renderer.rs`**: GPU pipeline setup, WGPU device management, and rendering state
+- **`scene.rs`**: Scene data management and glTF loading functionality
+- **`buffers.rs`**: Smart GPU buffer management with automatic resizing
+- **`compute.rs`**: Compute shader execution and progressive rendering logic
+- **`input.rs`**: Input handling and camera controls
+- **`gltf_loader.rs`**: Complete glTF 2.0 scene loading implementation
 
 ## Build System
 
@@ -56,7 +68,34 @@ The project now uses a **progressive tile-based rendering architecture** with **
 - **L**: Load glTF scene from "model.gltf" (replaces current scene)
 - **Resize**: Automatically triggers recomputation
 
-## Architecture
+## Modular Architecture
+
+### Module Responsibilities
+
+- **`renderer.rs`**: 
+  - `RenderState`: GPU device, pipelines, textures, and bind groups
+  - `ProgressiveState`: Tile-based rendering coordination and timing
+  - `PerformanceState`: Frame counting and performance tracking
+  - Pipeline creation and surface management
+
+- **`buffers.rs`**:
+  - `BufferManager`: Smart GPU buffer allocation with automatic resizing
+  - Buffer dirty tracking and batch updates
+  - Multi-buffer triangle system for large scenes
+
+- **`scene.rs`**:
+  - `SceneState`: Camera, geometry, materials, lights, and textures
+  - glTF scene loading and replacement functionality
+  - Default scene generation
+
+- **`input.rs`**:
+  - `InputState`: Mouse state tracking for camera controls
+  - `CameraController`: Camera movement and rotation logic
+
+- **`compute.rs`**:
+  - `ComputeRenderer`: Compute shader execution coordinator
+  - Progressive tile rendering logic
+  - Buffer update orchestration
 
 ### GPU Pipeline
 - **Compute shader**: Runs on GPU with 16x16 thread groups, writes to storage buffer
@@ -138,6 +177,9 @@ The default scene showcases the material system with:
 - **Blue glass spheres** (material ID 2) - Dielectric with transmission  
 - **Blue emissive sphere** (material ID 3) - Acts as area light
 - **Red and green triangles** - Different material demonstrations
+
+## Before implementing code
+- think carefully about the most optimal solution given the request and the project structure and state.
 
 # Summary instructions
 

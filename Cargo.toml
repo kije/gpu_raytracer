@@ -24,7 +24,8 @@ gltf = { version = "1.4", features = [
     "KHR_materials_pbrSpecularGlossiness",
     "KHR_lights_punctual",
     "extras", 
-    "names"
+    "names",
+    "extensions"
 ] }
 image = "0.24"
 exr = { version = "=1.5.0" }
