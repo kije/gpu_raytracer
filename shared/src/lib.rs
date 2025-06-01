@@ -662,17 +662,17 @@ impl TriangleLegacy {
             v2,
         }
     }
-    
+
     /// Calculate the bounding box of this triangle
     pub fn bounding_box(&self) -> Aabb {
         let min_x = self.v0[0].min(self.v1[0]).min(self.v2[0]);
         let min_y = self.v0[1].min(self.v1[1]).min(self.v2[1]);
         let min_z = self.v0[2].min(self.v1[2]).min(self.v2[2]);
-        
+
         let max_x = self.v0[0].max(self.v1[0]).max(self.v2[0]);
         let max_y = self.v0[1].max(self.v1[1]).max(self.v2[1]);
         let max_z = self.v0[2].max(self.v1[2]).max(self.v2[2]);
-        
+
         Aabb::new([min_x, min_y, min_z], [max_x, max_y, max_z])
     }
 
@@ -681,23 +681,23 @@ impl TriangleLegacy {
     pub fn to_indexed(triangles: &[TriangleLegacy]) -> (Vec<Vertex>, Vec<Triangle>) {
         let mut vertices = Vec::new();
         let mut indexed_triangles = Vec::new();
-        
+
         for triangle in triangles {
             let v0 = Vertex::new(triangle.v0);
             let v1 = Vertex::new(triangle.v1);
             let v2 = Vertex::new(triangle.v2);
-            
+
             // Find or add vertices (simple O(n) search, could be optimized with HashMap)
             let v0_index = Self::find_or_add_vertex(&mut vertices, v0);
             let v1_index = Self::find_or_add_vertex(&mut vertices, v1);
             let v2_index = Self::find_or_add_vertex(&mut vertices, v2);
-            
+
             indexed_triangles.push(Triangle::new_indexed(v0_index, v1_index, v2_index, triangle.material_id));
         }
-        
+
         (vertices, indexed_triangles)
     }
-    
+
     /// Helper function to find existing vertex or add new one
     #[cfg(not(target_arch = "spirv"))]
     fn find_or_add_vertex(vertices: &mut Vec<Vertex>, vertex: Vertex) -> u32 {
@@ -707,7 +707,7 @@ impl TriangleLegacy {
                 return i as u32;
             }
         }
-        
+
         // Add new vertex
         vertices.push(vertex);
         (vertices.len() - 1) as u32
@@ -905,7 +905,7 @@ impl SceneBuilder {
         self.spheres.push(Sphere::new(center, radius, material_id));
         self
     }
-    
+
     pub fn add_triangle(mut self, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], material_id: u32) -> Self {
         // Convert single triangle to indexed format
         let legacy_triangle = TriangleLegacy::new(v0, v1, v2, material_id);

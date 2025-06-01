@@ -21,7 +21,7 @@ impl SceneState {
         let (spheres, triangles, vertices, materials, lights) = SceneBuilder::build_default_scene();
         let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&triangles, &vertices);
         
-        Self {
+        let scene = Self {
             camera: Camera::new(),
             spheres,
             triangles,
@@ -32,7 +32,11 @@ impl SceneState {
             texture_data: Vec::new(),
             bvh_nodes: nodes,
             triangle_indices,
-        }
+        };
+        
+        // Print memory usage for default scene
+        scene.print_memory_usage("Default Scene");
+        scene
     }
 
     /// Load scene from glTF file
@@ -46,7 +50,7 @@ impl SceneState {
         // Build BVH for triangles
         let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&loaded_scene.triangles, &loaded_scene.vertices);
         
-        Ok(Self {
+        let scene = Self {
             camera,
             spheres: loaded_scene.spheres,
             triangles: loaded_scene.triangles,
@@ -57,7 +61,11 @@ impl SceneState {
             texture_data: loaded_scene.texture_data,
             bvh_nodes: nodes,
             triangle_indices,
-        })
+        };
+        
+        // Print memory usage for loaded glTF scene
+        scene.print_memory_usage("glTF Scene");
+        Ok(scene)
     }
 
     /// Load scene from glTF file with fallback to default scene
@@ -104,6 +112,9 @@ impl SceneState {
                  self.spheres.len(), self.triangles.len(), self.materials.len(),
                  self.lights.len(), self.textures.len(), self.bvh_nodes.len());
         
+        // Print memory usage for replaced scene
+        self.print_memory_usage("Replaced glTF Scene");
+        
         Ok(())
     }
     
@@ -113,5 +124,84 @@ impl SceneState {
         self.bvh_nodes = nodes;
         self.triangle_indices = triangle_indices;
         println!("Rebuilt BVH: {} nodes, {} triangle indices", self.bvh_nodes.len(), self.triangle_indices.len());
+    }
+    
+    /// Print detailed memory usage breakdown for scene data
+    pub fn print_memory_usage(&self, scene_name: &str) {
+        use std::mem::size_of;
+        
+        // Calculate memory usage for each component
+        let spheres_bytes = self.spheres.len() * size_of::<Sphere>();
+        let triangles_bytes = self.triangles.len() * size_of::<Triangle>();
+        let vertices_bytes = self.vertices.len() * size_of::<Vertex>();
+        let materials_bytes = self.materials.len() * size_of::<Material>();
+        let lights_bytes = self.lights.len() * size_of::<Light>();
+        let textures_bytes = self.textures.len() * size_of::<TextureInfo>();
+        let texture_data_bytes = self.texture_data.len();
+        let bvh_nodes_bytes = self.bvh_nodes.len() * size_of::<BvhNode>();
+        let triangle_indices_bytes = self.triangle_indices.len() * size_of::<u32>();
+        let camera_bytes = size_of::<Camera>();
+        
+        let total_bytes = spheres_bytes + triangles_bytes + vertices_bytes + materials_bytes + 
+                         lights_bytes + textures_bytes + texture_data_bytes + bvh_nodes_bytes + 
+                         triangle_indices_bytes + camera_bytes;
+        
+        // Helper function to format bytes as KB
+        let to_kb = |bytes: usize| bytes as f64 / 1024.0;
+        
+        println!("\n=== 📊 {} Memory Usage Breakdown ===", scene_name);
+        println!("┌─────────────────────┬───────────┬──────────┬─────────┐");
+        println!("│ Component           │ Count     │ Size KB  │ % Total │");
+        println!("├─────────────────────┼───────────┼──────────┼─────────┤");
+        println!("│ Triangles          │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.triangles.len(), to_kb(triangles_bytes), 
+                 (triangles_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Vertices           │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.vertices.len(), to_kb(vertices_bytes), 
+                 (vertices_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Triangle Indices   │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.triangle_indices.len(), to_kb(triangle_indices_bytes), 
+                 (triangle_indices_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ BVH Nodes          │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.bvh_nodes.len(), to_kb(bvh_nodes_bytes), 
+                 (bvh_nodes_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Materials          │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.materials.len(), to_kb(materials_bytes), 
+                 (materials_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Spheres            │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.spheres.len(), to_kb(spheres_bytes), 
+                 (spheres_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Lights             │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.lights.len(), to_kb(lights_bytes), 
+                 (lights_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Textures (meta)    │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.textures.len(), to_kb(textures_bytes), 
+                 (textures_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Texture Data       │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 self.texture_data.len(), to_kb(texture_data_bytes), 
+                 (texture_data_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("│ Camera             │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 1, to_kb(camera_bytes), 
+                 (camera_bytes as f64 / total_bytes as f64) * 100.0);
+        println!("├─────────────────────┼───────────┼──────────┼─────────┤");
+        println!("│ 🎯 TOTAL SCENE     │ {:>9} │ {:>8.1} │ {:>6.1}% │", 
+                 "items", to_kb(total_bytes), 100.0);
+        println!("└─────────────────────┴───────────┴──────────┴─────────┘");
+        
+        // Additional memory efficiency insights
+        if !self.triangles.is_empty() && !self.vertices.is_empty() {
+            let vertex_dedup_ratio = self.vertices.len() as f64 / (self.triangles.len() * 3) as f64;
+            let memory_savings = (1.0 - vertex_dedup_ratio) * 100.0;
+            println!("💡 Vertex deduplication: {:.1}% memory savings ({} unique vertices vs {} if duplicated)", 
+                     memory_savings, self.vertices.len(), self.triangles.len() * 3);
+        }
+        
+        if !self.bvh_nodes.is_empty() {
+            let bvh_overhead = (bvh_nodes_bytes as f64 / triangles_bytes as f64) * 100.0;
+            println!("⚡ BVH acceleration overhead: {:.1}% of triangle memory ({} nodes for {} triangles)", 
+                     bvh_overhead, self.bvh_nodes.len(), self.triangles.len());
+        }
+        
+        println!();
     }
 }
