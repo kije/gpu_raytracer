@@ -170,10 +170,15 @@ impl State {
             }
             VirtualKeyCode::L => {
                 // Try to load a glTF file
-                if let Err(e) = self.content.load_gltf("model.gltf") {
-                    println!("Failed to load glTF file: {:?}", e);
-                } else {
-                    self.trigger_recompute();
+                match self.content.load_gltf("model.gltf") {
+                    Ok(()) => {
+                        println!("Successfully loaded glTF scene from 'model.gltf'");
+                        self.trigger_recompute();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load 'model.gltf': {}", self.format_gltf_error(&e));
+                        eprintln!("Continuing with current scene...");
+                    }
                 }
             }
             _ => {}
@@ -193,6 +198,24 @@ impl State {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.graphics.render()
+    }
+    
+    /// Format glTF error with helpful context for users
+    fn format_gltf_error(&self, error: &gltf_loader::GltfError) -> String {
+        match error {
+            gltf_loader::GltfError::IoError(io_err) => {
+                format!("File not found or cannot be read ({})", io_err)
+            }
+            gltf_loader::GltfError::GltfError(gltf_err) => {
+                format!("Invalid glTF format ({})", gltf_err)
+            }
+            gltf_loader::GltfError::ValidationError(msg) => {
+                format!("Validation failed: {}", msg)
+            }
+            gltf_loader::GltfError::ImageError(img_err) => {
+                format!("Failed to load texture: {}", img_err)
+            }
+        }
     }
 }
 

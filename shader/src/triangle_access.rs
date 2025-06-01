@@ -18,13 +18,10 @@ impl TriangleAccessor {
         // Use a constant for the default triangle to avoid repeated construction
         const DEFAULT_TRIANGLE: Triangle = Triangle {
             v0: [0.0; 3],
-            _padding0: 0.0,
-            v1: [0.0; 3], 
-            _padding1: 0.0,
-            v2: [0.0; 3],
-            _padding2: 0.0,
             material_id: 0,
-            _padding3: [0.0; 3],
+            v1: [0.0; 3], 
+            _padding0: 0,
+            v2: [0.0; 3],
         };
 
         match buffer_index {

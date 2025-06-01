@@ -189,7 +189,7 @@ impl ComputeRenderer {
         actual_tile_height: u32,
         color_channel: u32,
         metadata_offsets: raytracer_shared::SceneMetadataOffsets,
-        tile_index_offset: u32,
+        _tile_index_offset: u32, // fixme remove
     ) {
         // Set the appropriate bind group for this color channel
         let bind_group = render.get_compute_bind_group(color_channel)
@@ -209,13 +209,6 @@ impl ComputeRenderer {
             metadata_offsets,
             color_channel,
         );
-        
-        // Debug: Log push constants for first tile of first channel only to avoid spam
-        if tile_index_offset == 0 && color_channel == 0 {
-            println!("Push constants: triangles={}, materials={}, spheres={}, lights={}, bvh_nodes={}", 
-                     scene.triangles.len(), scene.materials.len(), 
-                     metadata_offsets.spheres_count, metadata_offsets.lights_count, metadata_offsets.bvh_nodes_count);
-        }
         
         compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 

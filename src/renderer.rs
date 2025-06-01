@@ -144,66 +144,30 @@ impl RenderState {
 
         let compute_bind_group_layout = compute_pipeline.get_bind_group_layout(0);
         
-        // Create 3 separate compute bind groups (one for each color channel)
-        let compute_bind_group_red = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group Red"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture_red.create_view(&wgpu::TextureViewDescriptor::default())
-                    ),
-                },
-                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
-            ],
-        });
+        // Create 3 separate compute bind groups (one for each color channel) using helper
+        let compute_bind_group_red = Self::create_dummy_compute_bind_group(
+            &device, 
+            &compute_bind_group_layout, 
+            &raytraced_texture_red, 
+            &dummy_buffer, 
+            "Compute Bind Group Red"
+        );
 
-        let compute_bind_group_green = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group Green"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture_green.create_view(&wgpu::TextureViewDescriptor::default())
-                    ),
-                },
-                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
-            ],
-        });
+        let compute_bind_group_green = Self::create_dummy_compute_bind_group(
+            &device, 
+            &compute_bind_group_layout, 
+            &raytraced_texture_green, 
+            &dummy_buffer, 
+            "Compute Bind Group Green"
+        );
 
-        let compute_bind_group_blue = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group Blue"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture_blue.create_view(&wgpu::TextureViewDescriptor::default())
-                    ),
-                },
-                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
-            ],
-        });
+        let compute_bind_group_blue = Self::create_dummy_compute_bind_group(
+            &device, 
+            &compute_bind_group_layout, 
+            &raytraced_texture_blue, 
+            &dummy_buffer, 
+            "Compute Bind Group Blue"
+        );
 
         let render_bind_group_layout = render_pipeline.get_bind_group_layout(0);
         let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -596,6 +560,35 @@ impl RenderState {
                 },
             ],
         });
+    }
+
+    /// Helper function to create dummy compute bind groups during initialization
+    fn create_dummy_compute_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        output_texture: &wgpu::Texture,
+        dummy_buffer: &wgpu::Buffer,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &output_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
+            ],
+        })
     }
 
     /// Helper function to create compute bind groups with different output textures
