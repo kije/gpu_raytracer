@@ -1,6 +1,6 @@
 use raytracer_shared::{Triangle, PushConstants};
 use crate::ray::Ray;
-use crate::intersection::{IntersectionResult, ray_aabb_intersect, test_triangle_intersection};
+use crate::intersection::{IntersectionResult, ray_aabb_intersect};
 use crate::scene_access::SceneAccessor;
 use crate::triangle_access::TriangleAccessor;
 
@@ -112,7 +112,7 @@ impl<'a> BvhTraverser<'a> {
             
             let triangle_index = self.scene_accessor.get_triangle_index(triangle_start + i);
             
-            let (triangle_valid, triangle) = TriangleAccessor::get_triangle_from_buffers(
+            let (triangle_valid, v0, v1, v2, material_id) = TriangleAccessor::get_triangle_vertices_direct(
                 triangle_index,
                 triangles_buffer_0,
                 triangles_buffer_1,
@@ -121,7 +121,7 @@ impl<'a> BvhTraverser<'a> {
                 self.scene_accessor
             );
             if triangle_valid {
-                let test_result = test_triangle_intersection(ray, &triangle, closest_t);
+                let test_result = crate::intersection::test_triangle_intersection_direct(ray, v0, v1, v2, material_id, closest_t);
                 if test_result.hit {
                     closest_t = test_result.intersection.t;
                     result = test_result;

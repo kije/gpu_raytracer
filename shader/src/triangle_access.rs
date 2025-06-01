@@ -13,8 +13,55 @@ pub struct ExpandedTriangle {
 }
 
 impl TriangleAccessor {
+    /// Optimized triangle access that returns vertex positions directly without intermediate allocation
+    /// Returns (valid, v0, v1, v2, material_id) 
+    pub fn get_triangle_vertices_direct(
+        index: u32,
+        triangles_buffer_0: &[Triangle],
+        triangles_buffer_1: &[Triangle], 
+        triangles_buffer_2: &[Triangle],
+        push_constants: &PushConstants,
+        scene_accessor: &SceneAccessor
+    ) -> (bool, [f32; 3], [f32; 3], [f32; 3], u32) {
+        let buffer_index = index / push_constants.triangles_per_buffer;
+        let local_index = (index % push_constants.triangles_per_buffer) as usize;
+
+        // GPU-friendly triangle lookup without Option types
+        let mut triangle_valid = false;
+        let mut triangle = Triangle {
+            v0_index: 0,
+            v1_index: 0,
+            v2_index: 0,
+            material_id: 0,
+        };
+
+        if buffer_index == 0 && local_index < triangles_buffer_0.len() {
+            triangle = triangles_buffer_0[local_index];
+            triangle_valid = true;
+        } else if buffer_index == 1 && local_index < triangles_buffer_1.len() {
+            triangle = triangles_buffer_1[local_index];
+            triangle_valid = true;
+        } else if buffer_index == 2 && local_index < triangles_buffer_2.len() {
+            triangle = triangles_buffer_2[local_index];
+            triangle_valid = true;
+        }
+
+        if triangle_valid {
+            // Get vertex positions directly from scene metadata buffer
+            let v0 = scene_accessor.get_vertex_position(triangle.v0_index);
+            let v1 = scene_accessor.get_vertex_position(triangle.v1_index);
+            let v2 = scene_accessor.get_vertex_position(triangle.v2_index);
+            
+            (true, v0, v1, v2, triangle.material_id)
+        } else {
+            // Return default values for invalid triangle
+            (false, [0.0; 3], [0.0; 3], [0.0; 3], 0)
+        }
+    }
+
     /// Get triangle from multiple buffers with GPU-friendly result
     /// Returns an expanded triangle with vertex positions resolved from the vertex buffer
+    /// NOTE: Consider using get_triangle_vertices_direct for better performance
     pub fn get_triangle_from_buffers(
         index: u32,
         triangles_buffer_0: &[Triangle],

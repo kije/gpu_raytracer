@@ -87,18 +87,22 @@ pub fn test_sphere_intersection(
 }
 
 /// Test ray-triangle intersection using Möller-Trumbore algorithm
-pub fn test_triangle_intersection(
+/// Optimized version that takes vertex positions directly to avoid intermediate struct allocation
+pub fn test_triangle_intersection_direct(
     ray: &Ray,
-    triangle: &ExpandedTriangle,
+    v0: [f32; 3],
+    v1: [f32; 3], 
+    v2: [f32; 3],
+    material_id: u32,
     max_t: f32
 ) -> IntersectionResult {
-    let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);
-    let v1 = vec3(triangle.v1[0], triangle.v1[1], triangle.v1[2]);
-    let v2 = vec3(triangle.v2[0], triangle.v2[1], triangle.v2[2]);
+    let v0_vec = vec3(v0[0], v0[1], v0[2]);
+    let v1_vec = vec3(v1[0], v1[1], v1[2]);
+    let v2_vec = vec3(v2[0], v2[1], v2[2]);
 
     // Möller-Trumbore ray-triangle intersection
-    let edge1 = v1 - v0;
-    let edge2 = v2 - v0;
+    let edge1 = v1_vec - v0_vec;
+    let edge2 = v2_vec - v0_vec;
     let h = ray.direction.cross(edge2);
     let a = edge1.dot(h);
 
@@ -107,7 +111,7 @@ pub fn test_triangle_intersection(
     }
 
     let f = 1.0 / a;
-    let s = ray.origin - v0;
+    let s = ray.origin - v0_vec;
     let u = f * s.dot(h);
 
     if u < 0.0 || u > 1.0 {
@@ -127,10 +131,20 @@ pub fn test_triangle_intersection(
         let hit_point = ray.at(t);
         let hit_normal = edge1.cross(edge2).normalize();
         
-        IntersectionResult::hit(Intersection::new(t, hit_point, hit_normal, triangle.material_id))
+        IntersectionResult::hit(Intersection::new(t, hit_point, hit_normal, material_id))
     } else {
         IntersectionResult::miss()
     }
+}
+
+/// Test ray-triangle intersection using Möller-Trumbore algorithm
+/// Legacy version for backward compatibility with ExpandedTriangle
+pub fn test_triangle_intersection(
+    ray: &Ray,
+    triangle: &ExpandedTriangle,
+    max_t: f32
+) -> IntersectionResult {
+    test_triangle_intersection_direct(ray, triangle.v0, triangle.v1, triangle.v2, triangle.material_id, max_t)
 }
 
 /// Ray-AABB intersection test for BVH traversal

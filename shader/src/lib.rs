@@ -208,9 +208,9 @@ fn test_all_triangles_brute_force(
     let mut closest_t = max_t;
 
     for i in 0..push_constants.triangle_count {
-        let (triangle_valid, triangle) = TriangleAccessor::get_triangle_from_buffers(i, triangles_buffer_0, triangles_buffer_1, triangles_buffer_2, push_constants, &scene_accessor);
+        let (triangle_valid, v0, v1, v2, material_id) = TriangleAccessor::get_triangle_vertices_direct(i, triangles_buffer_0, triangles_buffer_1, triangles_buffer_2, push_constants, &scene_accessor);
         if triangle_valid {
-            let test_result = intersection::test_triangle_intersection(ray, &triangle, closest_t);
+            let test_result = intersection::test_triangle_intersection_direct(ray, v0, v1, v2, material_id, closest_t);
             if test_result.hit {
                 closest_t = test_result.intersection.t;
                 result = test_result;
