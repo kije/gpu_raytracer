@@ -3,7 +3,7 @@ use bvh::{
     bounding_hierarchy::BHShape,
     bvh::Bvh as BVH,
 };
-use raytracer_shared::{Triangle, Aabb, BvhNode};
+use raytracer_shared::{Triangle, Vertex, Aabb, BvhNode};
 
 // Type aliases for specific f32 3D types
 type Point3f = nalgebra::Point3<f32>;
@@ -23,38 +23,51 @@ impl BvhTriangle {
     }
     
     /// Get the center of the triangle
-    pub fn centroid(&self) -> Point3f {
-        let v0 = Point3f::new(self.triangle.v0[0], self.triangle.v0[1], self.triangle.v0[2]);
-        let v1 = Point3f::new(self.triangle.v1[0], self.triangle.v1[1], self.triangle.v1[2]);
-        let v2 = Point3f::new(self.triangle.v2[0], self.triangle.v2[1], self.triangle.v2[2]);
+    pub fn centroid(&self, vertices: &[Vertex]) -> Point3f {
+        let v0 = vertices[self.triangle.v0_index as usize].position;
+        let v1 = vertices[self.triangle.v1_index as usize].position;
+        let v2 = vertices[self.triangle.v2_index as usize].position;
         
-        Point3f::new(
-            (v0.x + v1.x + v2.x) / 3.0,
-            (v0.y + v1.y + v2.y) / 3.0,
-            (v0.z + v1.z + v2.z) / 3.0,
+        let center_x = (v0[0] + v1[0] + v2[0]) / 3.0;
+        let center_y = (v0[1] + v1[1] + v2[1]) / 3.0;
+        let center_z = (v0[2] + v1[2] + v2[2]) / 3.0;
+        
+        Point3f::new(center_x, center_y, center_z)
+    }
+}
+
+/// Custom Bounded implementation that needs vertex buffer
+/// We'll store vertices in BvhBuilder and use a custom method
+struct BvhTriangleWithVertices<'a> {
+    pub triangle: BvhTriangle,
+    pub vertices: &'a [Vertex],
+}
+
+impl<'a> Bounded<f32, 3> for BvhTriangleWithVertices<'a> {
+    fn aabb(&self) -> BvhAabbf {
+        let aabb = self.triangle.triangle.bounding_box(self.vertices);
+        BvhAabbf::with_bounds(
+            Point3f::new(aabb.min[0], aabb.min[1], aabb.min[2]),
+            Point3f::new(aabb.max[0], aabb.max[1], aabb.max[2]),
         )
     }
 }
 
+impl<'a> BHShape<f32, 3> for BvhTriangleWithVertices<'a> {
+    fn set_bh_node_index(&mut self, index: usize) {
+        self.triangle.set_bh_node_index(index);
+    }
+    
+    fn bh_node_index(&self) -> usize {
+        self.triangle.bh_node_index()
+    }
+}
+
+// Keep the original implementation for compatibility but mark it as invalid
 impl Bounded<f32, 3> for BvhTriangle {
     fn aabb(&self) -> BvhAabbf {
-        let v0 = Point3f::new(self.triangle.v0[0], self.triangle.v0[1], self.triangle.v0[2]);
-        let v1 = Point3f::new(self.triangle.v1[0], self.triangle.v1[1], self.triangle.v1[2]);
-        let v2 = Point3f::new(self.triangle.v2[0], self.triangle.v2[1], self.triangle.v2[2]);
-        
-        let min = Point3f::new(
-            v0.x.min(v1.x).min(v2.x),
-            v0.y.min(v1.y).min(v2.y),
-            v0.z.min(v1.z).min(v2.z),
-        );
-        
-        let max = Point3f::new(
-            v0.x.max(v1.x).max(v2.x),
-            v0.y.max(v1.y).max(v2.y),
-            v0.z.max(v1.z).max(v2.z),
-        );
-        
-        BvhAabbf::with_bounds(min, max)
+        // This should not be used - use BvhTriangleWithVertices instead
+        panic!("BvhTriangle::aabb() called without vertex buffer - use BvhTriangleWithVertices")
     }
 }
 
@@ -87,7 +100,7 @@ impl BvhBuilder {
     }
     
     /// Build BVH from triangles with optimized leaf sizes
-    pub fn build(triangles: &[Triangle]) -> BvhResult {
+    pub fn build(triangles: &[Triangle], vertices: &[Vertex]) -> BvhResult {
         if triangles.is_empty() {
             return BvhResult {
                 nodes: vec![BvhNode::leaf(
@@ -99,31 +112,45 @@ impl BvhBuilder {
             };
         }
         
-        // Use chunked approach for very large scenes
+        // Choose build strategy based on triangle count
         if triangles.len() > 100_000 {
-            Self::build_chunked(triangles)
+            Self::build_chunked(triangles, vertices)
         } else {
-            Self::build_standard(triangles)
+            Self::build_standard(triangles, vertices)
         }
     }
     
     /// Standard BVH build for smaller scenes
-    fn build_standard(triangles: &[Triangle]) -> BvhResult {
+    fn build_standard(triangles: &[Triangle], vertices: &[Vertex]) -> BvhResult {
         let mut bvh_triangles: Vec<BvhTriangle> = triangles
             .iter()
             .enumerate()
             .map(|(i, triangle)| BvhTriangle::new(*triangle, i))
             .collect();
         
+        // Create wrapper with vertices for BVH construction
+        let mut bvh_triangles_with_vertices: Vec<BvhTriangleWithVertices> = bvh_triangles
+            .iter()
+            .map(|triangle| BvhTriangleWithVertices {
+                triangle: *triangle,
+                vertices,
+            })
+            .collect();
+        
         // Build BVH using the bvh crate
-        let bvh = BVHf::build(&mut bvh_triangles);
+        let bvh = BVHf::build(&mut bvh_triangles_with_vertices);
+        
+        // Extract the updated triangles
+        for (i, wrapper) in bvh_triangles_with_vertices.iter().enumerate() {
+            bvh_triangles[i] = wrapper.triangle;
+        }
         
         // Convert BVH to our format
-        Self::convert_bvh_nodes(&bvh, &bvh_triangles)
+        Self::convert_bvh_nodes(&bvh, &bvh_triangles, vertices)
     }
     
     /// Chunked BVH build for large scenes to reduce memory usage
-    fn build_chunked(triangles: &[Triangle]) -> BvhResult {
+    fn build_chunked(triangles: &[Triangle], vertices: &[Vertex]) -> BvhResult {
         // For very large scenes, create much larger leaf nodes to dramatically reduce node count
         let triangles_per_leaf = (triangles.len() / 10_000).max(32); // Aim for ~10k nodes max
         let mut nodes = Vec::new();
@@ -134,7 +161,7 @@ impl BvhBuilder {
             // Calculate bounding box for this chunk
             let mut chunk_aabb = Aabb::empty();
             for triangle in chunk {
-                let tri_aabb = Self::triangle_aabb(triangle);
+                let tri_aabb = Self::triangle_aabb(triangle, vertices);
                 chunk_aabb = Aabb::union(&chunk_aabb, &tri_aabb);
             }
             
@@ -242,22 +269,12 @@ impl BvhBuilder {
     }
     
     /// Calculate AABB for a single triangle
-    fn triangle_aabb(triangle: &Triangle) -> Aabb {
-        let min = [
-            triangle.v0[0].min(triangle.v1[0]).min(triangle.v2[0]),
-            triangle.v0[1].min(triangle.v1[1]).min(triangle.v2[1]),
-            triangle.v0[2].min(triangle.v1[2]).min(triangle.v2[2]),
-        ];
-        let max = [
-            triangle.v0[0].max(triangle.v1[0]).max(triangle.v2[0]),
-            triangle.v0[1].max(triangle.v1[1]).max(triangle.v2[1]),
-            triangle.v0[2].max(triangle.v1[2]).max(triangle.v2[2]),
-        ];
-        Aabb::new(min, max)
+    fn triangle_aabb(triangle: &Triangle, vertices: &[Vertex]) -> Aabb {
+        triangle.bounding_box(vertices)
     }
     
     /// Convert bvh crate nodes to our BvhNode format
-    fn convert_bvh_nodes(bvh: &BVHf, bvh_triangles: &[BvhTriangle]) -> BvhResult {
+    fn convert_bvh_nodes(bvh: &BVHf, bvh_triangles: &[BvhTriangle], vertices: &[Vertex]) -> BvhResult {
         let mut nodes = Vec::new();
         let mut triangle_indices = Vec::new();
         
@@ -265,6 +282,7 @@ impl BvhBuilder {
             &bvh.nodes,
             0,
             bvh_triangles,
+            vertices,
             &mut nodes,
             &mut triangle_indices,
         );
@@ -280,6 +298,7 @@ impl BvhBuilder {
         bvh_nodes: &[bvh::bvh::BvhNode<f32, 3>],
         node_index: usize,
         bvh_triangles: &[BvhTriangle],
+        vertices: &[Vertex],
         result_nodes: &mut Vec<BvhNode>,
         triangle_indices: &mut Vec<u32>,
     ) -> u32 {
@@ -290,12 +309,22 @@ impl BvhBuilder {
         let current_result_index = result_nodes.len() as u32;
         let bvh_node = &bvh_nodes[node_index];
         
-        // Convert AABB
-        let bvh_aabb = bvh_node.get_node_aabb(bvh_triangles);
-        let aabb = Aabb::new(
-            bvh_aabb.min.coords.into(),
-            bvh_aabb.max.coords.into(),
-        );
+        // Convert AABB by calculating manually to avoid calling BvhTriangle::aabb
+        let aabb = match bvh_node {
+            bvh::bvh::BvhNode::Node { .. } => {
+                // For internal nodes, we'll calculate the AABB from children later
+                let bvh_aabb = bvh_node.get_node_aabb(bvh_triangles);
+                Aabb::new(
+                    bvh_aabb.min.coords.into(),
+                    bvh_aabb.max.coords.into(),
+                )
+            }
+            bvh::bvh::BvhNode::Leaf { shape_index, .. } => {
+                // For leaf nodes, calculate AABB from the triangle directly
+                let triangle = &bvh_triangles[*shape_index].triangle;
+                triangle.bounding_box(vertices)
+            }
+        };
         
         match bvh_node {
             bvh::bvh::BvhNode::Node {
@@ -311,6 +340,7 @@ impl BvhBuilder {
                     bvh_nodes,
                     *child_l_index,
                     bvh_triangles,
+                    vertices,
                     result_nodes,
                     triangle_indices,
                 );
@@ -319,6 +349,7 @@ impl BvhBuilder {
                     bvh_nodes,
                     *child_r_index,
                     bvh_triangles,
+                    vertices,
                     result_nodes,
                     triangle_indices,
                 );
@@ -351,35 +382,39 @@ pub struct BvhResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raytracer_shared::Triangle;
+    use raytracer_shared::{Triangle, Vertex};
     
     #[test]
     fn test_bvh_triangle_creation() {
-        let triangle = Triangle::new(
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.5, 1.0, 0.0],
-            0,
-        );
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([1.0, 0.0, 0.0]),
+            Vertex::new([0.5, 1.0, 0.0]),
+        ];
+        let triangle = Triangle::new_indexed(0, 1, 2, 0);
         
         let bvh_triangle = BvhTriangle::new(triangle, 0);
         assert_eq!(bvh_triangle.node_index, 0);
         
-        let center = bvh_triangle.centroid();
+        let center = bvh_triangle.centroid(&vertices);
         assert_eq!(center, Point3f::new(0.5, 1.0/3.0, 0.0));
     }
     
     #[test]
     fn test_bvh_triangle_bounding_box() {
-        let triangle = Triangle::new(
-            [0.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-            [1.0, 2.0, 0.0],
-            0,
-        );
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([2.0, 0.0, 0.0]),
+            Vertex::new([1.0, 2.0, 0.0]),
+        ];
+        let triangle = Triangle::new_indexed(0, 1, 2, 0);
         
         let bvh_triangle = BvhTriangle::new(triangle, 0);
-        let bbox = bvh_triangle.aabb();
+        let wrapper = BvhTriangleWithVertices {
+            triangle: bvh_triangle,
+            vertices: &vertices,
+        };
+        let bbox = wrapper.aabb();
         
         assert_eq!(bbox.min.coords, nalgebra::Vector3::new(0.0, 0.0, 0.0));
         assert_eq!(bbox.max.coords, nalgebra::Vector3::new(2.0, 2.0, 0.0));
@@ -388,7 +423,8 @@ mod tests {
     #[test]
     fn test_bvh_build_empty() {
         let triangles = Vec::new();
-        let result = BvhBuilder::build(&triangles);
+        let vertices = Vec::new();
+        let result = BvhBuilder::build(&triangles, &vertices);
         
         assert_eq!(result.nodes.len(), 1);
         assert!(result.nodes[0].is_leaf());
@@ -398,14 +434,14 @@ mod tests {
     
     #[test]
     fn test_bvh_build_single_triangle() {
-        let triangles = vec![Triangle::new(
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.5, 1.0, 0.0],
-            0,
-        )];
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([1.0, 0.0, 0.0]),
+            Vertex::new([0.5, 1.0, 0.0]),
+        ];
+        let triangles = vec![Triangle::new_indexed(0, 1, 2, 0)];
         
-        let result = BvhBuilder::build(&triangles);
+        let result = BvhBuilder::build(&triangles, &vertices);
         
         assert_eq!(result.nodes.len(), 1);
         assert!(result.nodes[0].is_leaf());
@@ -416,13 +452,24 @@ mod tests {
     
     #[test]
     fn test_bvh_build_multiple_triangles() {
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([1.0, 0.0, 0.0]),
+            Vertex::new([0.5, 1.0, 0.0]),
+            Vertex::new([2.0, 0.0, 0.0]),
+            Vertex::new([3.0, 0.0, 0.0]),
+            Vertex::new([2.5, 1.0, 0.0]),
+            Vertex::new([4.0, 0.0, 0.0]),
+            Vertex::new([5.0, 0.0, 0.0]),
+            Vertex::new([4.5, 1.0, 0.0]),
+        ];
         let triangles = vec![
-            Triangle::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0], 0),
-            Triangle::new([2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.5, 1.0, 0.0], 1),
-            Triangle::new([4.0, 0.0, 0.0], [5.0, 0.0, 0.0], [4.5, 1.0, 0.0], 2),
+            Triangle::new_indexed(0, 1, 2, 0),
+            Triangle::new_indexed(3, 4, 5, 1),
+            Triangle::new_indexed(6, 7, 8, 2),
         ];
         
-        let result = BvhBuilder::build(&triangles);
+        let result = BvhBuilder::build(&triangles, &vertices);
         
         // Should have some internal nodes for 3 triangles
         assert!(!result.nodes.is_empty());
@@ -436,12 +483,20 @@ mod tests {
     
     #[test]
     fn test_bvh_node_bounds() {
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([1.0, 0.0, 0.0]),
+            Vertex::new([0.5, 1.0, 0.0]),
+            Vertex::new([2.0, 0.0, 0.0]),
+            Vertex::new([3.0, 0.0, 0.0]),
+            Vertex::new([2.5, 1.0, 0.0]),
+        ];
         let triangles = vec![
-            Triangle::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0], 0),
-            Triangle::new([2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.5, 1.0, 0.0], 1),
+            Triangle::new_indexed(0, 1, 2, 0),
+            Triangle::new_indexed(3, 4, 5, 1),
         ];
         
-        let result = BvhBuilder::build(&triangles);
+        let result = BvhBuilder::build(&triangles, &vertices);
         
         // Root node should encompass all triangles
         let root = &result.nodes[0];
@@ -449,5 +504,20 @@ mod tests {
         assert!(root.bounds.max[0] >= 3.0);
         assert!(root.bounds.min[1] <= 0.0);
         assert!(root.bounds.max[1] >= 1.0);
+    }
+    
+    #[test]
+    fn test_triangle_aabb() {
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([2.0, 0.0, 0.0]),
+            Vertex::new([1.0, 3.0, 0.0]),
+        ];
+        let triangle = Triangle::new_indexed(0, 1, 2, 0);
+        
+        let aabb = BvhBuilder::triangle_aabb(&triangle, &vertices);
+        
+        assert_eq!(aabb.min, [0.0, 0.0, 0.0]);
+        assert_eq!(aabb.max, [2.0, 3.0, 0.0]);
     }
 }

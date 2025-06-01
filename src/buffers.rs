@@ -1,5 +1,5 @@
 use bytemuck;
-use raytracer_shared::{Sphere, Triangle, Material, Light, TextureInfo, BvhNode, RaytracerConfig, SceneMetadataOffsets};
+use raytracer_shared::{Sphere, Triangle, Vertex, Material, Light, TextureInfo, BvhNode, RaytracerConfig, SceneMetadataOffsets};
 
 /// Smart buffer management for geometry data with combined scene metadata buffer
 pub struct BufferManager {
@@ -23,6 +23,7 @@ pub struct BufferManager {
     pub lights_capacity: usize,
     pub bvh_nodes_capacity: usize,
     pub triangle_indices_capacity: usize,
+    pub vertices_capacity: usize,
     
     // Dirty tracking
     pub scene_metadata_dirty: bool,
@@ -36,6 +37,7 @@ pub struct BufferManager {
     last_lights_count: usize,
     last_bvh_nodes_count: usize,
     last_triangle_indices_count: usize,
+    last_vertices_count: usize,
     last_triangles_count: usize,
     last_materials_count: usize,
     last_textures_count: usize,
@@ -67,6 +69,7 @@ impl BufferManager {
         let lights_capacity = 32; // Default lights capacity
         let bvh_nodes_capacity = 256; // Default BVH nodes capacity
         let triangle_indices_capacity = 1024; // Default triangle indices capacity
+        let vertices_capacity = 1024; // Default vertices capacity
         let triangles_per_buffer = Self::max_triangles_per_buffer();
         let materials_capacity = 64; // Default materials capacity
         let textures_capacity = 64; // Default textures capacity
@@ -76,7 +79,8 @@ impl BufferManager {
         let scene_metadata_capacity = spheres_capacity * std::mem::size_of::<Sphere>() +
                                      lights_capacity * std::mem::size_of::<Light>() +
                                      bvh_nodes_capacity * std::mem::size_of::<BvhNode>() +
-                                     triangle_indices_capacity * std::mem::size_of::<u32>();
+                                     triangle_indices_capacity * std::mem::size_of::<u32>() +
+                                     vertices_capacity * std::mem::size_of::<Vertex>();
 
         let scene_metadata_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scene Metadata Buffer"),
@@ -131,6 +135,7 @@ impl BufferManager {
             lights_capacity,
             bvh_nodes_capacity,
             triangle_indices_capacity,
+            vertices_capacity,
             scene_metadata_dirty: true,
             triangles_dirty: true,
             materials_dirty: true,
@@ -140,6 +145,7 @@ impl BufferManager {
             last_lights_count: 0,
             last_bvh_nodes_count: 0,
             last_triangle_indices_count: 0,
+            last_vertices_count: 0,
             last_triangles_count: 0,
             last_materials_count: 0,
             last_textures_count: 0,
@@ -147,7 +153,7 @@ impl BufferManager {
         }
     }
     
-    /// Update scene metadata buffer with incremental updates for spheres, lights, BVH nodes, and triangle indices
+    /// Update scene metadata buffer with incremental updates for spheres, lights, BVH nodes, triangle indices, and vertices
     pub fn update_scene_metadata(
         &mut self, 
         device: &wgpu::Device, 
@@ -155,14 +161,16 @@ impl BufferManager {
         spheres: &[Sphere], 
         lights: &[Light],
         bvh_nodes: &[BvhNode], 
-        triangle_indices: &[u32]
+        triangle_indices: &[u32],
+        vertices: &[Vertex]
     ) -> (bool, SceneMetadataOffsets) {
         let spheres_size = spheres.len() * std::mem::size_of::<Sphere>();
         let lights_size = lights.len() * std::mem::size_of::<Light>();
         let bvh_nodes_size = bvh_nodes.len() * std::mem::size_of::<BvhNode>();
         let triangle_indices_size = triangle_indices.len() * std::mem::size_of::<u32>();
+        let vertices_size = vertices.len() * std::mem::size_of::<Vertex>();
         
-        let total_size = spheres_size + lights_size + bvh_nodes_size + triangle_indices_size;
+        let total_size = spheres_size + lights_size + bvh_nodes_size + triangle_indices_size + vertices_size;
         let needs_resize = total_size > self.scene_metadata_capacity;
         
         // Check if data actually changed for incremental updates
@@ -170,8 +178,9 @@ impl BufferManager {
         let lights_changed = lights.len() != self.last_lights_count;
         let bvh_nodes_changed = bvh_nodes.len() != self.last_bvh_nodes_count;
         let triangle_indices_changed = triangle_indices.len() != self.last_triangle_indices_count;
+        let vertices_changed = vertices.len() != self.last_vertices_count;
         
-        let any_changed = spheres_changed || lights_changed || bvh_nodes_changed || triangle_indices_changed;
+        let any_changed = spheres_changed || lights_changed || bvh_nodes_changed || triangle_indices_changed || vertices_changed;
         
         if needs_resize {
             // Double the capacity to accommodate growth  
@@ -179,11 +188,13 @@ impl BufferManager {
             self.lights_capacity = (lights.len() * 2).max(32);
             self.bvh_nodes_capacity = (bvh_nodes.len() * 2).max(256);
             self.triangle_indices_capacity = (triangle_indices.len() * 2).max(1024);
+            self.vertices_capacity = (vertices.len() * 2).max(1024);
             
             self.scene_metadata_capacity = self.spheres_capacity * std::mem::size_of::<Sphere>() +
                                           self.lights_capacity * std::mem::size_of::<Light>() +
                                           self.bvh_nodes_capacity * std::mem::size_of::<BvhNode>() +
-                                          self.triangle_indices_capacity * std::mem::size_of::<u32>();
+                                          self.triangle_indices_capacity * std::mem::size_of::<u32>() +
+                                          self.vertices_capacity * std::mem::size_of::<Vertex>();
             
             self.scene_metadata_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Scene Metadata Combined Buffer"),
@@ -192,8 +203,8 @@ impl BufferManager {
                 mapped_at_creation: false,
             });
             
-            println!("Resized scene metadata buffer: {} spheres, {} lights, {} BVH nodes, {} triangle indices ({:.2} MB)",
-                     self.spheres_capacity, self.lights_capacity, self.bvh_nodes_capacity, self.triangle_indices_capacity,
+            println!("Resized scene metadata buffer: {} spheres, {} lights, {} BVH nodes, {} triangle indices, {} vertices ({:.2} MB)",
+                     self.spheres_capacity, self.lights_capacity, self.bvh_nodes_capacity, self.triangle_indices_capacity, self.vertices_capacity,
                      self.scene_metadata_capacity as f64 / (1024.0 * 1024.0));
         }
         
@@ -217,6 +228,10 @@ impl BufferManager {
             
             let _triangle_indices_offset_u32 = offset_in_bytes / 4;
             combined_data.extend_from_slice(bytemuck::cast_slice(triangle_indices));
+            offset_in_bytes += triangle_indices_size;
+            
+            let _vertices_offset_u32 = offset_in_bytes / 4;
+            combined_data.extend_from_slice(bytemuck::cast_slice(vertices));
             
             queue.write_buffer(
                 &self.scene_metadata_buffer,
@@ -231,10 +246,11 @@ impl BufferManager {
             self.last_lights_count = lights.len();
             self.last_bvh_nodes_count = bvh_nodes.len();
             self.last_triangle_indices_count = triangle_indices.len();
+            self.last_vertices_count = vertices.len();
             
             if any_changed && !needs_resize {
-                println!("Incremental scene metadata update: {} spheres, {} lights, {} BVH nodes, {} triangle indices",
-                         spheres.len(), lights.len(), bvh_nodes.len(), triangle_indices.len());
+                println!("Incremental scene metadata update: {} spheres, {} lights, {} BVH nodes, {} triangle indices, {} vertices",
+                         spheres.len(), lights.len(), bvh_nodes.len(), triangle_indices.len(), vertices.len());
             }
         }
         
@@ -247,6 +263,8 @@ impl BufferManager {
             bvh_nodes.len() as u32,
             ((spheres_size + lights_size + bvh_nodes_size) / 4) as u32, // triangle indices offset in u32 units
             triangle_indices.len() as u32,
+            ((spheres_size + lights_size + bvh_nodes_size + triangle_indices_size) / 4) as u32, // vertices offset in u32 units
+            vertices.len() as u32, // vertices count
         );
         
         (needs_resize, offsets)

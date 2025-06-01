@@ -117,7 +117,8 @@ impl<'a> BvhTraverser<'a> {
                 triangles_buffer_0,
                 triangles_buffer_1,
                 triangles_buffer_2,
-                push_constants
+                push_constants,
+                self.scene_accessor
             );
             if triangle_valid {
                 let test_result = test_triangle_intersection(ray, &triangle, closest_t);

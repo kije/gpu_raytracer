@@ -145,29 +145,11 @@ impl RenderState {
         let compute_bind_group_layout = compute_pipeline.get_bind_group_layout(0);
         
         // Create 3 separate compute bind groups (one for each color channel) using helper
-        let compute_bind_group_red = Self::create_dummy_compute_bind_group(
-            &device, 
-            &compute_bind_group_layout, 
-            &raytraced_texture_red, 
-            &dummy_buffer, 
-            "Compute Bind Group Red"
-        );
-
-        let compute_bind_group_green = Self::create_dummy_compute_bind_group(
-            &device, 
-            &compute_bind_group_layout, 
-            &raytraced_texture_green, 
-            &dummy_buffer, 
-            "Compute Bind Group Green"
-        );
-
-        let compute_bind_group_blue = Self::create_dummy_compute_bind_group(
-            &device, 
-            &compute_bind_group_layout, 
-            &raytraced_texture_blue, 
-            &dummy_buffer, 
-            "Compute Bind Group Blue"
-        );
+        let textures = [&raytraced_texture_red, &raytraced_texture_green, &raytraced_texture_blue];
+        let labels = ["Compute Bind Group Red", "Compute Bind Group Green", "Compute Bind Group Blue"];
+        
+        let (compute_bind_group_red, compute_bind_group_green, compute_bind_group_blue) = 
+            Self::create_all_dummy_compute_bind_groups(&device, &compute_bind_group_layout, &textures, &dummy_buffer, &labels);
 
         let render_bind_group_layout = render_pipeline.get_bind_group_layout(0);
         let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -504,27 +486,13 @@ impl RenderState {
         
         // Recreate 3 separate compute bind groups (one for each color channel)
         let compute_bind_group_layout = self.compute_pipeline.get_bind_group_layout(0);
+        let textures = [&self.raytraced_texture_red, &self.raytraced_texture_green, &self.raytraced_texture_blue];
+        let labels = ["Compute Bind Group Red", "Compute Bind Group Green", "Compute Bind Group Blue"];
         
-        self.compute_bind_group_red = self.create_compute_bind_group(
-            &compute_bind_group_layout, 
-            &self.raytraced_texture_red, 
-            buffers, 
-            "Compute Bind Group Red"
-        );
-
-        self.compute_bind_group_green = self.create_compute_bind_group(
-            &compute_bind_group_layout, 
-            &self.raytraced_texture_green, 
-            buffers, 
-            "Compute Bind Group Green"
-        );
-
-        self.compute_bind_group_blue = self.create_compute_bind_group(
-            &compute_bind_group_layout, 
-            &self.raytraced_texture_blue, 
-            buffers, 
-            "Compute Bind Group Blue"
-        );
+        let (red, green, blue) = self.create_all_compute_bind_groups(&compute_bind_group_layout, &textures, buffers, &labels);
+        self.compute_bind_group_red = red;
+        self.compute_bind_group_green = green;
+        self.compute_bind_group_blue = blue;
 
         // Recreate render bind group with all 3 color channel textures
         let render_bind_group_layout = self.render_pipeline.get_bind_group_layout(0);
@@ -562,7 +530,51 @@ impl RenderState {
         });
     }
 
-    /// Helper function to create dummy compute bind groups during initialization
+    /// Helper function to create all three dummy compute bind groups efficiently during initialization
+    fn create_all_dummy_compute_bind_groups(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        textures: &[&wgpu::Texture; 3],
+        dummy_buffer: &wgpu::Buffer,
+        labels: &[&str; 3],
+    ) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
+        (
+            Self::create_single_dummy_compute_bind_group(device, layout, textures[0], dummy_buffer, labels[0]),
+            Self::create_single_dummy_compute_bind_group(device, layout, textures[1], dummy_buffer, labels[1]),
+            Self::create_single_dummy_compute_bind_group(device, layout, textures[2], dummy_buffer, labels[2]),
+        )
+    }
+
+    /// Helper function to create a single dummy compute bind group
+    fn create_single_dummy_compute_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        texture: &wgpu::Texture,
+        dummy_buffer: &wgpu::Buffer,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Helper function to create dummy compute bind groups during initialization (legacy single version)
     fn create_dummy_compute_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -591,7 +603,78 @@ impl RenderState {
         })
     }
 
-    /// Helper function to create compute bind groups with different output textures
+    /// Helper function to create all three compute bind groups efficiently
+    fn create_all_compute_bind_groups(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        textures: &[&wgpu::Texture; 3],
+        buffers: &BufferManager,
+        labels: &[&str; 3],
+    ) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
+        (
+            self.create_single_compute_bind_group_with_buffers(layout, textures[0], buffers, labels[0]),
+            self.create_single_compute_bind_group_with_buffers(layout, textures[1], buffers, labels[1]),
+            self.create_single_compute_bind_group_with_buffers(layout, textures[2], buffers, labels[2]),
+        )
+    }
+
+    /// Helper function to create a single compute bind group with buffer manager
+    fn create_single_compute_bind_group_with_buffers(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        texture: &wgpu::Texture,
+        buffers: &BufferManager,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.scene_metadata_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.get_triangle_buffer(0)
+                        .unwrap_or(&buffers.triangle_buffers[0])
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffers.get_triangle_buffer(1)
+                        .unwrap_or(&buffers.triangle_buffers[0])
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buffers.get_triangle_buffer(2)
+                        .unwrap_or(&buffers.triangle_buffers[0])
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buffers.materials_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: buffers.texture_data_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Helper function to create compute bind groups with different output textures (legacy single version)
     fn create_compute_bind_group(
         &self,
         layout: &wgpu::BindGroupLayout,

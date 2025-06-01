@@ -1,5 +1,5 @@
 use spirv_std::glam::{vec3, Vec3};
-use raytracer_shared::{Sphere, Light, BvhNode, PushConstants};
+use raytracer_shared::{Sphere, Light, BvhNode, Vertex, PushConstants};
 
 /// Provides access to scene data stored in the combined metadata buffer
 pub struct SceneAccessor<'a> {
@@ -163,5 +163,17 @@ impl<'a> SceneAccessor<'a> {
         let base_offset = self.push_constants.metadata_offsets.triangle_indices_offset as usize;
         let triangle_index_offset = base_offset + (index as usize);
         self.scene_metadata[triangle_index_offset]
+    }
+    
+    /// Get vertex position from vertices buffer
+    pub fn get_vertex_position(&self, vertex_index: u32) -> [f32; 3] {
+        let base_offset = self.push_constants.metadata_offsets.vertices_offset as usize;
+        let vertex_offset_u32 = base_offset + (vertex_index as usize * (core::mem::size_of::<Vertex>() / 4));
+        
+        [
+            f32::from_bits(self.scene_metadata[vertex_offset_u32]),
+            f32::from_bits(self.scene_metadata[vertex_offset_u32 + 1]),
+            f32::from_bits(self.scene_metadata[vertex_offset_u32 + 2]),
+        ]
     }
 }

@@ -85,7 +85,7 @@ impl ComputeRenderer {
         
         let (_scene_metadata_resized, metadata_offsets) = buffers.update_scene_metadata(
             &render.device, &render.queue, &scene.spheres, &scene.lights, 
-            &scene.bvh_nodes, &scene.triangle_indices
+            &scene.bvh_nodes, &scene.triangle_indices, &scene.vertices
         );
         let _triangles_resized = buffers.update_triangles(&render.device, &render.queue, &scene.triangles);
         let _materials_resized = buffers.update_materials(&render.device, &render.queue, &scene.materials);
@@ -198,7 +198,6 @@ impl ComputeRenderer {
         
         let push_constants = PushConstants::new(
             [render.size.width as f32, render.size.height as f32],
-            performance.start_time.elapsed().as_secs_f32(),
             scene.camera,
             scene.triangles.len() as u32,
             scene.materials.len() as u32,

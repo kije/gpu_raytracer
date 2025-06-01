@@ -127,6 +127,7 @@ fn find_closest_intersection(
     } else {
         test_all_triangles_brute_force(
             ray,
+            scene_accessor,
             triangles_buffer_0,
             triangles_buffer_1,
             triangles_buffer_2, 
@@ -196,6 +197,7 @@ fn test_sphere_intersections(
 /// Brute force triangle intersection testing (fallback)
 fn test_all_triangles_brute_force(
     ray: &Ray,
+    scene_accessor: &SceneAccessor,
     triangles_buffer_0: &[Triangle],
     triangles_buffer_1: &[Triangle], 
     triangles_buffer_2: &[Triangle],
@@ -206,7 +208,7 @@ fn test_all_triangles_brute_force(
     let mut closest_t = max_t;
 
     for i in 0..push_constants.triangle_count {
-        let (triangle_valid, triangle) = TriangleAccessor::get_triangle_from_buffers(i, triangles_buffer_0, triangles_buffer_1, triangles_buffer_2, push_constants);
+        let (triangle_valid, triangle) = TriangleAccessor::get_triangle_from_buffers(i, triangles_buffer_0, triangles_buffer_1, triangles_buffer_2, push_constants, &scene_accessor);
         if triangle_valid {
             let test_result = intersection::test_triangle_intersection(ray, &triangle, closest_t);
             if test_result.hit {

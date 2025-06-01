@@ -105,17 +105,38 @@ pub struct Sphere {
     // Total: 20 bytes (37.5% reduction from 32 bytes)
 }
 
-/// Triangle primitive for raytracing
-/// Optimized layout: 40 bytes (reduced from 64 bytes with better packing)
+/// Vertex for indexed triangle rendering
+/// Optimized storage: 12 bytes per unique vertex
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
+#[repr(C)]
+pub struct Vertex {
+    pub position: [f32; 3], // Vertex position (12 bytes)
+    // Total: 12 bytes
+}
+
+/// Triangle primitive using vertex indices for memory efficiency
+/// Optimized layout: 16 bytes (60% reduction from 40 bytes for typical meshes)
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct Triangle {
+    pub v0_index: u32,      // Index to vertex in vertex buffer (4 bytes)
+    pub v1_index: u32,      // Index to vertex in vertex buffer (4 bytes)
+    pub v2_index: u32,      // Index to vertex in vertex buffer (4 bytes)
+    pub material_id: u32,   // Index into material buffer (4 bytes)
+    // Total: 16 bytes (60% reduction from 40 bytes for typical meshes)
+}
+
+/// Legacy triangle structure for backward compatibility
+/// Use Triangle + Vertex for new code
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct TriangleLegacy {
     pub v0: [f32; 3],       // First vertex (12 bytes)
     pub material_id: u32,   // Index into material buffer (4 bytes) 
     pub v1: [f32; 3],       // Second vertex (12 bytes)
     pub _padding0: u32,     // Padding for alignment (4 bytes)
     pub v2: [f32; 3],       // Third vertex (12 bytes)
-    // Total: 40 bytes (37.5% reduction from 64 bytes)
+    // Total: 40 bytes
 }
 
 /// Axis-Aligned Bounding Box for BVH
@@ -151,6 +172,8 @@ pub struct SceneMetadataOffsets {
     pub bvh_nodes_count: u32,      // Number of BVH nodes
     pub triangle_indices_offset: u32, // Offset to triangle indices (in u32 units)
     pub triangle_indices_count: u32,  // Number of triangle indices
+    pub vertices_offset: u32,      // Offset to vertices data (in u32 units)
+    pub vertices_count: u32,       // Number of vertices
 }
 
 /// Push constants for compute shader
@@ -158,7 +181,6 @@ pub struct SceneMetadataOffsets {
 #[repr(C)]
 pub struct PushConstants {
     pub resolution: [f32; 2],
-    pub time: f32,
     pub camera: Camera,
     pub triangle_count: u32,
     pub material_count: u32,
@@ -168,7 +190,6 @@ pub struct PushConstants {
     pub triangles_per_buffer: u32, // Triangles per buffer for multi-buffer access
     pub metadata_offsets: SceneMetadataOffsets, // Combined scene metadata offsets
     pub color_channel: u32,        // 0=red, 1=green, 2=blue for chromatic aberration
-    pub _padding: [u32; 1],        // Padding for alignment
 }
 
 impl Camera {
@@ -594,8 +615,44 @@ impl Sphere {
     }
 }
 
+impl Vertex {
+    /// Create a new vertex
+    pub fn new(position: [f32; 3]) -> Self {
+        Self { position }
+    }
+}
+
 impl Triangle {
-    /// Create a new triangle
+    /// Create a new triangle with vertex indices
+    pub fn new_indexed(v0_index: u32, v1_index: u32, v2_index: u32, material_id: u32) -> Self {
+        Self {
+            v0_index,
+            v1_index,
+            v2_index,
+            material_id,
+        }
+    }
+    
+    /// Calculate the bounding box of this triangle using a vertex buffer
+    pub fn bounding_box(&self, vertices: &[Vertex]) -> Aabb {
+        let v0 = vertices[self.v0_index as usize].position;
+        let v1 = vertices[self.v1_index as usize].position;
+        let v2 = vertices[self.v2_index as usize].position;
+        
+        let min_x = v0[0].min(v1[0]).min(v2[0]);
+        let min_y = v0[1].min(v1[1]).min(v2[1]);
+        let min_z = v0[2].min(v1[2]).min(v2[2]);
+        
+        let max_x = v0[0].max(v1[0]).max(v2[0]);
+        let max_y = v0[1].max(v1[1]).max(v2[1]);
+        let max_z = v0[2].max(v1[2]).max(v2[2]);
+        
+        Aabb::new([min_x, min_y, min_z], [max_x, max_y, max_z])
+    }
+}
+
+impl TriangleLegacy {
+    /// Create a new triangle (legacy format)
     pub fn new(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], material_id: u32) -> Self {
         Self {
             v0,
@@ -617,6 +674,43 @@ impl Triangle {
         let max_z = self.v0[2].max(self.v1[2]).max(self.v2[2]);
         
         Aabb::new([min_x, min_y, min_z], [max_x, max_y, max_z])
+    }
+
+    /// Convert to indexed format with vertex deduplication
+    #[cfg(not(target_arch = "spirv"))]
+    pub fn to_indexed(triangles: &[TriangleLegacy]) -> (Vec<Vertex>, Vec<Triangle>) {
+        let mut vertices = Vec::new();
+        let mut indexed_triangles = Vec::new();
+        
+        for triangle in triangles {
+            let v0 = Vertex::new(triangle.v0);
+            let v1 = Vertex::new(triangle.v1);
+            let v2 = Vertex::new(triangle.v2);
+            
+            // Find or add vertices (simple O(n) search, could be optimized with HashMap)
+            let v0_index = Self::find_or_add_vertex(&mut vertices, v0);
+            let v1_index = Self::find_or_add_vertex(&mut vertices, v1);
+            let v2_index = Self::find_or_add_vertex(&mut vertices, v2);
+            
+            indexed_triangles.push(Triangle::new_indexed(v0_index, v1_index, v2_index, triangle.material_id));
+        }
+        
+        (vertices, indexed_triangles)
+    }
+    
+    /// Helper function to find existing vertex or add new one
+    #[cfg(not(target_arch = "spirv"))]
+    fn find_or_add_vertex(vertices: &mut Vec<Vertex>, vertex: Vertex) -> u32 {
+        // Look for existing vertex
+        for (i, existing) in vertices.iter().enumerate() {
+            if *existing == vertex {
+                return i as u32;
+            }
+        }
+        
+        // Add new vertex
+        vertices.push(vertex);
+        (vertices.len() - 1) as u32
     }
 }
 
@@ -713,6 +807,8 @@ impl SceneMetadataOffsets {
         bvh_nodes_count: u32,
         triangle_indices_offset: u32,
         triangle_indices_count: u32,
+        vertices_offset: u32,
+        vertices_count: u32,
     ) -> Self {
         Self {
             spheres_offset,
@@ -723,6 +819,8 @@ impl SceneMetadataOffsets {
             bvh_nodes_count,
             triangle_indices_offset,
             triangle_indices_count,
+            vertices_offset,
+            vertices_count,
         }
     }
 }
@@ -731,7 +829,6 @@ impl PushConstants {
     /// Create new push constants
     pub fn new(
         resolution: [f32; 2],
-        time: f32,
         camera: Camera,
         triangle_count: u32,
         material_count: u32,
@@ -744,7 +841,6 @@ impl PushConstants {
     ) -> Self {
         Self {
             resolution,
-            time,
             camera,
             triangle_count,
             material_count,
@@ -754,7 +850,6 @@ impl PushConstants {
             triangles_per_buffer,
             metadata_offsets,
             color_channel,
-            _padding: [0; 1],
         }
     }
 }
@@ -812,11 +907,14 @@ impl SceneBuilder {
     }
     
     pub fn add_triangle(mut self, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], material_id: u32) -> Self {
-        self.triangles.push(Triangle::new(v0, v1, v2, material_id));
+        // Convert single triangle to indexed format
+        let legacy_triangle = TriangleLegacy::new(v0, v1, v2, material_id);
+        let (_vertices, indexed_triangles) = TriangleLegacy::to_indexed(&[legacy_triangle]);
+        self.triangles.extend(indexed_triangles);
         self
     }
     
-    pub fn build_default_scene() -> (Vec<Sphere>, Vec<Triangle>, Vec<Material>, Vec<Light>) {
+    pub fn build_default_scene() -> (Vec<Sphere>, Vec<Triangle>, Vec<Vertex>, Vec<Material>, Vec<Light>) {
         use alloc::vec;
         
         // Create materials
@@ -836,14 +934,15 @@ impl SceneBuilder {
             Sphere::new([-1.0, 2.0, -5.0], 0.5, 3),  // Blue light
         ];
         
-        let triangles = vec![
-            Triangle::new(
+        // Create legacy triangles first, then convert to indexed format
+        let legacy_triangles = vec![
+            TriangleLegacy::new(
                 [0.0, 1.0, -2.0],  // Top vertex
                 [-0.5, 0.0, -2.0], // Bottom left
                 [0.5, 0.0, -2.0],  // Bottom right
                 0                   // Red diffuse material
             ),
-            Triangle::new(
+            TriangleLegacy::new(
                 [1.5, 0.5, -3.0],  // Right triangle
                 [1.0, -0.5, -3.0],
                 [2.0, -0.5, -3.0],
@@ -851,11 +950,14 @@ impl SceneBuilder {
             ),
         ];
         
+        // Convert to indexed format for memory efficiency
+        let (vertices, triangles) = TriangleLegacy::to_indexed(&legacy_triangles);
+        
         let lights = vec![
             Light::point([5.0, 7.0, 4.0], [1.0,1.0,1.0] ,1.0, f32::INFINITY) // White light
         ];
         
-        (spheres, triangles, materials, lights)
+        (spheres, triangles, vertices, materials, lights)
     }
     
     pub fn build(self) -> (Vec<Sphere>, Vec<Triangle>, Vec<Material>) {
@@ -939,14 +1041,17 @@ mod test {
 
     #[test]
     fn test_triangle_bounding_box() {
-        let triangle = Triangle::new(
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0], 
-            [0.5, 1.0, 0.0],
-            0
-        );
+        use alloc::vec;
         
-        let bbox = triangle.bounding_box();
+        // Create vertices and indexed triangle
+        let vertices = vec![
+            Vertex::new([0.0, 0.0, 0.0]),
+            Vertex::new([1.0, 0.0, 0.0]),
+            Vertex::new([0.5, 1.0, 0.0]),
+        ];
+        let triangle = Triangle::new_indexed(0, 1, 2, 0);
+        
+        let bbox = triangle.bounding_box(&vertices);
         assert_eq!(bbox.min, [0.0, 0.0, 0.0]);
         assert_eq!(bbox.max, [1.0, 1.0, 0.0]);
     }
@@ -1003,10 +1108,9 @@ mod test {
     #[test]
     fn test_push_constants_with_metadata() {
         let camera = Camera::new();
-        let metadata = SceneMetadataOffsets::new(0, 10, 500, 2, 600, 50, 1000, 100);
+        let metadata = SceneMetadataOffsets::new(0, 10, 500, 2, 600, 50, 1000, 100, 1500, 20);
         let constants = PushConstants::new(
             [1920.0, 1080.0],
-            0.0,
             camera,
             20,
             5,

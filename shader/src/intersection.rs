@@ -1,8 +1,9 @@
 use spirv_std::glam::{vec3, Vec3};
 use spirv_std::num_traits::Float;
-use raytracer_shared::{Triangle, RaytracerConfig};
+use raytracer_shared::RaytracerConfig;
 use crate::ray::Ray;
 use crate::scene_access::SceneAccessor;
+use crate::triangle_access::ExpandedTriangle;
 
 /// Intersection data
 #[derive(Clone, Copy)]
@@ -88,7 +89,7 @@ pub fn test_sphere_intersection(
 /// Test ray-triangle intersection using Möller-Trumbore algorithm
 pub fn test_triangle_intersection(
     ray: &Ray,
-    triangle: &Triangle,
+    triangle: &ExpandedTriangle,
     max_t: f32
 ) -> IntersectionResult {
     let v0 = vec3(triangle.v0[0], triangle.v0[1], triangle.v0[2]);

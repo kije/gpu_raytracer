@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use gltf::{Document, Node, Primitive, Camera as GltfCamera};
-use raytracer_shared::{Triangle, Material, Sphere, Camera, Light, TextureInfo};
+use raytracer_shared::{Triangle, Vertex, Material, Sphere, Camera, Light, TextureInfo};
 use image::DynamicImage;
 
 /// Enhanced glTF loader with support for GLB, textures, lights, and advanced materials
@@ -41,6 +41,7 @@ impl From<image::ImageError> for GltfError {
 /// Enhanced loaded scene data with lights, cameras, and textures
 pub struct LoadedScene {
     pub triangles: Vec<Triangle>,
+    pub vertices: Vec<Vertex>,
     pub materials: Vec<Material>,
     pub spheres: Vec<Sphere>,
     pub lights: Vec<Light>,
@@ -84,6 +85,7 @@ impl GltfLoader {
         };
 
         let mut triangles = Vec::new();
+        let mut vertices = Vec::new();
         let mut materials = Vec::new();
         let mut spheres = Vec::new();
         let mut lights = Vec::new();
@@ -104,14 +106,15 @@ impl GltfLoader {
 
         // Process nodes recursively
         for node in scene.nodes() {
-            self.process_node(&node, &glam::Mat4::IDENTITY, &material_map, &mut triangles, &mut spheres, &mut lights, &mut cameras)?;
+            self.process_node(&node, &glam::Mat4::IDENTITY, &material_map, &mut triangles, &mut vertices, &mut spheres, &mut lights, &mut cameras)?;
         }
 
-        println!("Loaded glTF scene: {} triangles, {} materials, {} spheres, {} lights, {} cameras, {} textures", 
-                 triangles.len(), materials.len(), spheres.len(), lights.len(), cameras.len(), textures.len());
+        println!("Loaded glTF scene: {} triangles, {} vertices, {} materials, {} spheres, {} lights, {} cameras, {} textures", 
+                 triangles.len(), vertices.len(), materials.len(), spheres.len(), lights.len(), cameras.len(), textures.len());
 
         Ok(LoadedScene {
             triangles,
+            vertices,
             materials,
             spheres,
             lights,
@@ -187,6 +190,7 @@ impl GltfLoader {
         parent_transform: &glam::Mat4,
         material_map: &HashMap<usize, u32>,
         triangles: &mut Vec<Triangle>,
+        vertices: &mut Vec<Vertex>,
         spheres: &mut Vec<Sphere>,
         lights: &mut Vec<Light>,
         cameras: &mut Vec<Camera>,
@@ -198,7 +202,7 @@ impl GltfLoader {
         // Process mesh if present
         if let Some(mesh) = node.mesh() {
             for primitive in mesh.primitives() {
-                self.process_primitive(&primitive, &transform, material_map, triangles)?;
+                self.process_primitive(&primitive, &transform, material_map, triangles, vertices)?;
             }
         }
 
@@ -216,7 +220,7 @@ impl GltfLoader {
 
         // Process children recursively
         for child in node.children() {
-            self.process_node(&child, &transform, material_map, triangles, spheres, lights, cameras)?;
+            self.process_node(&child, &transform, material_map, triangles, vertices, spheres, lights, cameras)?;
         }
 
         Ok(())
@@ -279,13 +283,14 @@ impl GltfLoader {
         }
     }
 
-    /// Process a mesh primitive (convert to triangles)
+    /// Process a mesh primitive (convert to indexed triangles with vertex deduplication)
     fn process_primitive(
         &self,
         primitive: &Primitive,
         transform: &glam::Mat4,
         material_map: &HashMap<usize, u32>,
         triangles: &mut Vec<Triangle>,
+        vertices: &mut Vec<Vertex>,
     ) -> Result<(), GltfError> {
         // Get material ID
         let material_id = primitive.material().index()
@@ -298,6 +303,32 @@ impl GltfLoader {
 
         let positions_data = self.get_accessor_data::<[f32; 3]>(&positions)?;
 
+        // Use HashMap for vertex deduplication (position-based)
+        let mut vertex_map: HashMap<[u32; 3], u32> = HashMap::new(); // position bits -> vertex index
+        
+        // Helper function to get or create vertex index with deduplication
+        let mut get_vertex_index = |position: [f32; 3]| -> u32 {
+            let transformed_pos = self.transform_vertex(position, transform);
+            
+            // Convert to bits for exact comparison
+            let pos_bits = [
+                transformed_pos[0].to_bits(),
+                transformed_pos[1].to_bits(), 
+                transformed_pos[2].to_bits(),
+            ];
+            
+            if let Some(&existing_index) = vertex_map.get(&pos_bits) {
+                existing_index
+            } else {
+                let new_index = vertices.len() as u32;
+                vertices.push(Vertex {
+                    position: transformed_pos,
+                });
+                vertex_map.insert(pos_bits, new_index);
+                new_index
+            }
+        };
+
         // Handle different topology types
         match primitive.mode() {
             gltf::mesh::Mode::Triangles => {
@@ -307,20 +338,22 @@ impl GltfLoader {
                     
                     for chunk in indices_data.chunks(3) {
                         if chunk.len() == 3 {
-                            let v0 = self.transform_vertex(positions_data[chunk[0] as usize], transform);
-                            let v1 = self.transform_vertex(positions_data[chunk[1] as usize], transform);
-                            let v2 = self.transform_vertex(positions_data[chunk[2] as usize], transform);
-                            triangles.push(Triangle::new(v0, v1, v2, material_id));
+                            let v0_idx = get_vertex_index(positions_data[chunk[0] as usize]);
+                            let v1_idx = get_vertex_index(positions_data[chunk[1] as usize]);
+                            let v2_idx = get_vertex_index(positions_data[chunk[2] as usize]);
+                            
+                            triangles.push(Triangle::new_indexed(v0_idx, v1_idx, v2_idx, material_id));
                         }
                     }
                 } else {
                     // Non-indexed triangles
                     for chunk in positions_data.chunks(3) {
                         if chunk.len() == 3 {
-                            let v0 = self.transform_vertex(chunk[0], transform);
-                            let v1 = self.transform_vertex(chunk[1], transform);
-                            let v2 = self.transform_vertex(chunk[2], transform);
-                            triangles.push(Triangle::new(v0, v1, v2, material_id));
+                            let v0_idx = get_vertex_index(chunk[0]);
+                            let v1_idx = get_vertex_index(chunk[1]);
+                            let v2_idx = get_vertex_index(chunk[2]);
+                            
+                            triangles.push(Triangle::new_indexed(v0_idx, v1_idx, v2_idx, material_id));
                         }
                     }
                 }
@@ -328,26 +361,27 @@ impl GltfLoader {
             gltf::mesh::Mode::TriangleFan => {
                 // Triangle fan: first vertex is shared by all triangles
                 if positions_data.len() >= 3 {
-                    let center = self.transform_vertex(positions_data[0], transform);
+                    let center_idx = get_vertex_index(positions_data[0]);
                     for i in 1..positions_data.len() - 1 {
-                        let v1 = self.transform_vertex(positions_data[i], transform);
-                        let v2 = self.transform_vertex(positions_data[i + 1], transform);
-                        triangles.push(Triangle::new(center, v1, v2, material_id));
+                        let v1_idx = get_vertex_index(positions_data[i]);
+                        let v2_idx = get_vertex_index(positions_data[i + 1]);
+                        
+                        triangles.push(Triangle::new_indexed(center_idx, v1_idx, v2_idx, material_id));
                     }
                 }
             }
             gltf::mesh::Mode::TriangleStrip => {
                 // Triangle strip: each new vertex forms a triangle with previous two
                 for i in 0..positions_data.len().saturating_sub(2) {
-                    let v0 = self.transform_vertex(positions_data[i], transform);
-                    let v1 = self.transform_vertex(positions_data[i + 1], transform);
-                    let v2 = self.transform_vertex(positions_data[i + 2], transform);
+                    let v0_idx = get_vertex_index(positions_data[i]);
+                    let v1_idx = get_vertex_index(positions_data[i + 1]);
+                    let v2_idx = get_vertex_index(positions_data[i + 2]);
                     
                     // Alternate winding order for strips
                     if i % 2 == 0 {
-                        triangles.push(Triangle::new(v0, v1, v2, material_id));
+                        triangles.push(Triangle::new_indexed(v0_idx, v1_idx, v2_idx, material_id));
                     } else {
-                        triangles.push(Triangle::new(v0, v2, v1, material_id));
+                        triangles.push(Triangle::new_indexed(v0_idx, v2_idx, v1_idx, material_id));
                     }
                 }
             }

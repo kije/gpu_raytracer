@@ -1,4 +1,4 @@
-use raytracer_shared::{Camera, Sphere, Triangle, Material, Light, TextureInfo, SceneBuilder, BvhNode};
+use raytracer_shared::{Camera, Sphere, Triangle, Vertex, Material, Light, TextureInfo, SceneBuilder, BvhNode};
 use crate::gltf_loader::{GltfLoader, GltfError};
 use crate::bvh::{BvhBuilder, BvhResult};
 
@@ -7,6 +7,7 @@ pub struct SceneState {
     pub camera: Camera,
     pub spheres: Vec<Sphere>,
     pub triangles: Vec<Triangle>,
+    pub vertices: Vec<Vertex>,
     pub materials: Vec<Material>,
     pub lights: Vec<Light>,
     pub textures: Vec<TextureInfo>,
@@ -17,13 +18,14 @@ pub struct SceneState {
 
 impl SceneState {
     pub fn new() -> Self {
-        let (spheres, triangles, materials, lights) = SceneBuilder::build_default_scene();
-        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&triangles);
+        let (spheres, triangles, vertices, materials, lights) = SceneBuilder::build_default_scene();
+        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&triangles, &vertices);
         
         Self {
             camera: Camera::new(),
             spheres,
             triangles,
+            vertices,
             materials,
             lights,
             textures: Vec::new(),
@@ -42,12 +44,13 @@ impl SceneState {
         let camera = loaded_scene.cameras.first().copied().unwrap_or_else(Camera::new);
         
         // Build BVH for triangles
-        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&loaded_scene.triangles);
+        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&loaded_scene.triangles, &loaded_scene.vertices);
         
         Ok(Self {
             camera,
             spheres: loaded_scene.spheres,
             triangles: loaded_scene.triangles,
+            vertices: loaded_scene.vertices,
             materials: loaded_scene.materials,
             lights: loaded_scene.lights,
             textures: loaded_scene.textures,
@@ -86,13 +89,14 @@ impl SceneState {
         
         self.spheres = loaded_scene.spheres;
         self.triangles = loaded_scene.triangles;
+        self.vertices = loaded_scene.vertices;
         self.materials = loaded_scene.materials;
         self.lights = loaded_scene.lights;
         self.textures = loaded_scene.textures;
         self.texture_data = loaded_scene.texture_data;
         
         // Rebuild BVH for new triangles
-        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&self.triangles);
+        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&self.triangles, &self.vertices);
         self.bvh_nodes = nodes;
         self.triangle_indices = triangle_indices;
         
@@ -105,7 +109,7 @@ impl SceneState {
     
     /// Rebuild BVH when triangles change
     pub fn rebuild_bvh(&mut self) {
-        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&self.triangles);
+        let BvhResult { nodes, triangle_indices } = BvhBuilder::build(&self.triangles, &self.vertices);
         self.bvh_nodes = nodes;
         self.triangle_indices = triangle_indices;
         println!("Rebuilt BVH: {} nodes, {} triangle indices", self.bvh_nodes.len(), self.triangle_indices.len());
