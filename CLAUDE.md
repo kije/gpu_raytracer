@@ -46,7 +46,7 @@ cargo run --release
 
 ## Architecture Changes (Latest)
 
-The project now uses a **progressive tile-based rendering architecture** with **BVH acceleration**, **PBR material system**, and **comprehensive glTF 2.0 loading**:
+The project now uses a **progressive tile-based rendering architecture** with **BVH acceleration**, **PBR material system**, **comprehensive glTF 2.0 loading**, and **chromatic aberration**:
 
 - **Progressive Rendering**: Raytracing uses 128x128 pixel tiles processed incrementally for real-time feedback
 - **BVH Acceleration**: Full BVH (Bounding Volume Hierarchy) implementation for fast triangle intersection
@@ -54,16 +54,17 @@ The project now uses a **progressive tile-based rendering architecture** with **
 - **PBR Materials**: Physically-based rendering with metallic/roughness workflow, ready for Microfacet BRDF
 - **Enhanced Material System**: Extended PBR materials supporting KHR extensions (specular, volume, transmission, IOR)
 - **glTF 2.0 Support**: Complete glTF/GLB scene loading with cameras, lights, textures, and materials
-- **Compute Phase**: Raytracing runs in compute shader, writes directly to storage texture
-- **Render Phase**: Fragment shader samples the raytraced texture onto a fullscreen quad
+- **Chromatic Aberration**: Multi-pass rendering with wavelength-dependent refraction simulating chromatic dispersion in glass materials
+- **Compute Phase**: Raytracing runs in compute shader, 3 passes per tile (R,G,B channels), writes to separate color channel textures
+- **Render Phase**: Fragment shader samples and combines 3 chromatic aberration textures onto a fullscreen quad
 - **Performance**: Raytracing only re-runs when needed (window resize, user input like spacebar)
 - **Scalability**: Complex raytracing won't block the render loop
 - **Branchless GPU Code**: Optimized branchless algorithms for GPU efficiency
 - **Shared Crate**: Common data structures eliminate code duplication between main app and shader
 
 ### Pipeline Structure
-1. **Compute Pipeline**: `main_cs` → Storage texture (rgba8) via progressive tiles
-2. **Render Pipeline**: `main_vs` + `main_fs` → Screen framebuffer
+1. **Compute Pipeline**: `main_cs` → 3 storage textures (rgba8) via progressive tiles, one per color channel (R,G,B)
+2. **Render Pipeline**: `main_vs` + `main_fs` → Screen framebuffer (combines 3 chromatic aberration textures)
 
 ### Controls
 - **Spacebar**: Trigger raytracer recomputation
@@ -116,11 +117,11 @@ The project now uses a **progressive tile-based rendering architecture** with **
 
 ### Shader Interface
 - **Push constants**: `PushConstants` struct shared between host and shader for resolution/time/camera/tile/material/metadata data
-- **Storage texture**: Direct writes to rgba8 texture for progressive tile rendering
+- **Storage textures**: Direct writes to 3 separate rgba8 textures for progressive tile rendering with chromatic aberration
 - **Combined Scene Metadata Buffer**: Single buffer containing spheres, lights, BVH nodes, and triangle indices with `SceneMetadataOffsets` for indexing
 - **Storage buffers**: Maximum of 8 storage buffers due to GPU limitations
-- **Bindings**: 
-  - Descriptor set 0, binding 0: Storage texture (write)
+- **Bindings (Compute)**: 
+  - Descriptor set 0, binding 0: Storage texture (write) - switches between R/G/B textures per pass
   - Descriptor set 0, binding 1: Combined scene metadata buffer (spheres, lights, BVH, triangle indices) (read)
   - Descriptor set 0, binding 2: Triangles buffer 0 (read)
   - Descriptor set 0, binding 3: Triangles buffer 1 (read)
@@ -128,6 +129,11 @@ The project now uses a **progressive tile-based rendering architecture** with **
   - Descriptor set 0, binding 5: Materials buffer (read)
   - Descriptor set 0, binding 6: Textures buffer (read)
   - Descriptor set 0, binding 7: Texture data buffer (read)
+- **Bindings (Render)**: 
+  - Descriptor set 0, binding 0: Red channel texture (read)
+  - Descriptor set 0, binding 1: Green channel texture (read)
+  - Descriptor set 0, binding 2: Blue channel texture (read)
+  - Descriptor set 0, binding 3: Sampler for all textures
 
 ### Shared Data Structures (`shared/` crate)
 - **Camera**: Position, direction, up vector, FOV - uses `[f32; 3]` arrays for cross-platform compatibility
@@ -139,7 +145,7 @@ The project now uses a **progressive tile-based rendering architecture** with **
 - **Aabb**: Axis-aligned bounding box for BVH acceleration
 - **BvhNode**: BVH node with bounds, child indices, and triangle data for acceleration structure
 - **SceneMetadataOffsets**: Offsets for combined scene metadata buffer layout
-- **PushConstants**: Resolution, time, camera, tile info, material count, metadata offsets - all shader parameters
+- **PushConstants**: Resolution, time, camera, tile info, material count, metadata offsets, color channel - all shader parameters
 - **Branchless Macros**: GPU-optimized branchless conditional operations
 - **Cross-platform compatibility**: Uses arrays instead of Vec types, works in both std and no_std environments
 
@@ -188,6 +194,7 @@ The compute shader (`shader/src/lib.rs`) is a `#![no_std]` crate that:
 - Implements progressive tile-based raytracing with sphere and triangle intersection
 - **BVH Traversal**: Uses BVH acceleration structure for fast triangle intersection
 - **Combined Buffer Access**: Reads from combined scene metadata buffer with offset-based indexing
+- **Chromatic Aberration**: Implements wavelength-dependent IOR using Cauchy equation for realistic chromatic dispersion
 - Evaluates PBR materials with simplified BRDF (ready for Microfacet BRDF upgrade)
 - Handles material types: diffuse, metallic, glass (transmission), and emissive
 - Converts array-based shared structs to Vec3 types for mathematical operations
@@ -201,7 +208,7 @@ The compute shader (`shader/src/lib.rs`) is a `#![no_std]` crate that:
 The default scene showcases the material system with:
 - **Red diffuse sphere** (material ID 0) - Lambert diffuse
 - **Yellow metallic spheres** (material ID 1) - Low roughness metal
-- **Blue glass spheres** (material ID 2) - Dielectric with transmission  
+- **Blue glass spheres** (material ID 2) - Dielectric with transmission and chromatic aberration  
 - **Blue emissive sphere** (material ID 3) - Acts as area light
 - **Red and green triangles** - Different material demonstrations
 
