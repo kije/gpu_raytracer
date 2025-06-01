@@ -1,5 +1,5 @@
 use winit::{
-    event::{Event, WindowEvent, KeyboardInput, VirtualKeyCode, ElementState, MouseButton},
+    event::{ElementState, MouseButton},
 };
 use raytracer_shared::{RaytracerConfig};
 

@@ -57,16 +57,7 @@ pub fn test_sphere_intersection(
     let sphere_center = scene_accessor.get_sphere_center(sphere_index);
     let sphere_radius = scene_accessor.get_sphere_radius(sphere_index);
     
-    // Quick AABB test for sphere
-    let sphere_min = sphere_center - Vec3::splat(sphere_radius);
-    let sphere_max = sphere_center + Vec3::splat(sphere_radius);
-    
-    // Only test intersection if ray intersects sphere's AABB
-    if !ray_aabb_intersect(ray.origin, ray.direction, sphere_min, sphere_max) {
-        return IntersectionResult::miss();
-    }
-
-    // Sphere intersection
+    // Direct sphere intersection - AABB test removed as it's redundant for spheres
     let oc = ray.origin - sphere_center;
     let a = ray.direction.dot(ray.direction);
     let b = 2.0 * oc.dot(ray.direction);

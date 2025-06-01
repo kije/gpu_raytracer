@@ -1,8 +1,8 @@
 use wgpu::{TextureUsages, util::make_spirv};
-use bytemuck;
+
 use raytracer_shared::{PushConstants, RaytracerConfig, TileHelper};
 use crate::buffers::BufferManager;
-use crate::scene::SceneState;
+
 
 /// GPU resources and rendering pipelines
 pub struct RenderState {
@@ -27,6 +27,13 @@ pub struct RenderState {
     pub compute_bind_group_green: wgpu::BindGroup,
     pub compute_bind_group_blue: wgpu::BindGroup,
     pub render_bind_group: wgpu::BindGroup,
+    
+    // Buffer reference tracking for optimized bind group recreation
+    last_scene_metadata_buffer_ptr: *const wgpu::Buffer,
+    last_triangle_buffers_count: usize,
+    last_materials_buffer_ptr: *const wgpu::Buffer,
+    last_textures_buffer_ptr: *const wgpu::Buffer,
+    last_texture_data_buffer_ptr: *const wgpu::Buffer,
 }
 
 /// Progressive tile rendering state
@@ -109,50 +116,8 @@ impl RenderState {
         });
 
         // Create 3 separate textures for chromatic aberration (R, G, B channels)
-        let raytraced_texture_red = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Raytraced Texture Red"),
-            size: wgpu::Extent3d {
-                width: size.width,
-                height: size.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
-        let raytraced_texture_green = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Raytraced Texture Green"),
-            size: wgpu::Extent3d {
-                width: size.width,
-                height: size.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
-        let raytraced_texture_blue = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Raytraced Texture Blue"),
-            size: wgpu::Extent3d {
-                width: size.width,
-                height: size.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
+        let (raytraced_texture_red, raytraced_texture_green, raytraced_texture_blue) = 
+            Self::create_raytraced_textures(&device, size.width, size.height);
 
         // Create sampler for texture
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -290,6 +255,12 @@ impl RenderState {
             compute_bind_group_green,
             compute_bind_group_blue,
             render_bind_group,
+            // Initialize buffer tracking to null pointers
+            last_scene_metadata_buffer_ptr: std::ptr::null(),
+            last_triangle_buffers_count: 0,
+            last_materials_buffer_ptr: std::ptr::null(),
+            last_textures_buffer_ptr: std::ptr::null(),
+            last_texture_data_buffer_ptr: std::ptr::null(),
         }
     }
 
@@ -496,6 +467,32 @@ impl RenderState {
         (compute_pipeline, render_pipeline)
     }
 
+    /// Helper function to create raytraced textures for chromatic aberration
+    fn create_raytraced_textures(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::Texture, wgpu::Texture) {
+        let create_texture = |label: &str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+
+        (
+            create_texture("Raytraced Texture Red"),
+            create_texture("Raytraced Texture Green"),
+            create_texture("Raytraced Texture Blue"),
+        )
+    }
+
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -504,54 +501,43 @@ impl RenderState {
             self.surface.configure(&self.device, &self.config);
 
             // Recreate 3 separate raytraced textures for chromatic aberration
-            self.raytraced_texture_red = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Raytraced Texture Red"),
-                size: wgpu::Extent3d {
-                    width: new_size.width,
-                    height: new_size.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-
-            self.raytraced_texture_green = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Raytraced Texture Green"),
-                size: wgpu::Extent3d {
-                    width: new_size.width,
-                    height: new_size.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-
-            self.raytraced_texture_blue = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Raytraced Texture Blue"),
-                size: wgpu::Extent3d {
-                    width: new_size.width,
-                    height: new_size.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
+            let (red, green, blue) = Self::create_raytraced_textures(&self.device, new_size.width, new_size.height);
+            self.raytraced_texture_red = red;
+            self.raytraced_texture_green = green;
+            self.raytraced_texture_blue = blue;
         }
     }
 
+    /// Recreate bind groups with updated buffer references
     pub fn recreate_bind_groups(&mut self, buffers: &BufferManager) {
+        // Check if any buffer references have changed (resizing)
+        let scene_metadata_ptr = &buffers.scene_metadata_buffer as *const wgpu::Buffer;
+        let triangle_buffers_count = buffers.triangle_buffers.len();
+        let materials_ptr = &buffers.materials_buffer as *const wgpu::Buffer;
+        let textures_ptr = &buffers.textures_buffer as *const wgpu::Buffer;
+        let texture_data_ptr = &buffers.texture_data_buffer as *const wgpu::Buffer;
+        
+        let any_buffer_resized = 
+            scene_metadata_ptr != self.last_scene_metadata_buffer_ptr ||
+            triangle_buffers_count != self.last_triangle_buffers_count ||
+            materials_ptr != self.last_materials_buffer_ptr ||
+            textures_ptr != self.last_textures_buffer_ptr ||
+            texture_data_ptr != self.last_texture_data_buffer_ptr;
+        
+        // Recreate bind groups for both resize and content changes
+        let _recreation_reason = if any_buffer_resized {
+            "Buffer references changed"
+        } else {
+            "Buffer content changed"
+        };
+        
+        // Update tracking state
+        self.last_scene_metadata_buffer_ptr = scene_metadata_ptr;
+        self.last_triangle_buffers_count = triangle_buffers_count;
+        self.last_materials_buffer_ptr = materials_ptr;
+        self.last_textures_buffer_ptr = textures_ptr;
+        self.last_texture_data_buffer_ptr = texture_data_ptr;
+        
         // Recreate 3 separate compute bind groups (one for each color channel)
         let compute_bind_group_layout = self.compute_pipeline.get_bind_group_layout(0);
         
@@ -636,15 +622,21 @@ impl RenderState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: buffers.get_triangle_buffer(0).as_entire_binding(),
+                    resource: buffers.get_triangle_buffer(0)
+                        .unwrap_or(&buffers.triangle_buffers[0])
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: buffers.get_triangle_buffer(1).as_entire_binding(),
+                    resource: buffers.get_triangle_buffer(1)
+                        .unwrap_or(&buffers.triangle_buffers[0])
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: buffers.get_triangle_buffer(2).as_entire_binding(),
+                    resource: buffers.get_triangle_buffer(2)
+                        .unwrap_or(&buffers.triangle_buffers[0])
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
@@ -663,12 +655,12 @@ impl RenderState {
     }
 
     /// Get the appropriate compute bind group for the given color channel
-    pub fn get_compute_bind_group(&self, color_channel: u32) -> &wgpu::BindGroup {
+    pub fn get_compute_bind_group(&self, color_channel: u32) -> Result<&wgpu::BindGroup, String> {
         match color_channel {
-            0 => &self.compute_bind_group_red,
-            1 => &self.compute_bind_group_green,
-            2 => &self.compute_bind_group_blue,
-            _ => &self.compute_bind_group_red, // Fallback
+            0 => Ok(&self.compute_bind_group_red),
+            1 => Ok(&self.compute_bind_group_green),
+            2 => Ok(&self.compute_bind_group_blue),
+            _ => Err(format!("Invalid color channel: {}. Valid channels are 0 (red), 1 (green), 2 (blue)", color_channel)),
         }
     }
 

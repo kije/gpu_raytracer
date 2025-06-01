@@ -360,7 +360,7 @@ impl GltfLoader {
     }
 
     /// Convert glTF material to enhanced raytracer material
-    fn convert_material(&self, gltf_material: &gltf::Material, textures: &[TextureInfo]) -> Result<Material, GltfError> {
+    fn convert_material(&self, gltf_material: &gltf::Material, _textures: &[TextureInfo]) -> Result<Material, GltfError> {
         let mut material = if let Some(spec_gloss) = gltf_material.pbr_specular_glossiness() {
             // KHR_materials_pbrSpecularGlossiness workflow
             let diffuse = spec_gloss.diffuse_factor();
@@ -462,7 +462,7 @@ impl GltfLoader {
     }
 
     /// Get accessor data as a specific type
-    fn get_accessor_data<T: Clone + Default>(&self, accessor: &gltf::Accessor) -> Result<Vec<T>, GltfError> {
+    fn get_accessor_data<T: Clone + Default + bytemuck::Pod>(&self, accessor: &gltf::Accessor) -> Result<Vec<T>, GltfError> {
         let buffer_view = accessor.view()
             .ok_or_else(|| GltfError::ValidationError("Accessor missing buffer view".to_string()))?;
         
@@ -479,7 +479,7 @@ impl GltfLoader {
             let end = offset + accessor.size();
             
             if end <= buffer_data.len() {
-                // For simplicity, assume T is [f32; 3] for positions
+                // Safe casting using bytemuck for well-defined types
                 if std::mem::size_of::<T>() == 12 { // [f32; 3]
                     let slice = &buffer_data[offset..offset + 12];
                     let array: [f32; 3] = [
@@ -487,9 +487,16 @@ impl GltfLoader {
                         f32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]),
                         f32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]),
                     ];
-                    // Unsafe transmute, but we know the types match
-                    let value = unsafe { std::mem::transmute_copy::<[f32; 3], T>(&array) };
-                    result.push(value);
+                    // Safe casting using bytemuck - only works for compatible types
+                    if let Ok(value) = bytemuck::try_cast::<[f32; 3], T>(array) {
+                        result.push(value);
+                    } else {
+                        return Err(GltfError::ValidationError(format!(
+                            "Type conversion failed for accessor data: expected size {}, got size {}", 
+                            std::mem::size_of::<T>(), 
+                            std::mem::size_of::<[f32; 3]>()
+                        )));
+                    }
                 } else {
                     result.push(T::default());
                 }

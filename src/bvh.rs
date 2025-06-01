@@ -3,7 +3,7 @@ use bvh::{
     bounding_hierarchy::BHShape,
     bvh::Bvh as BVH,
 };
-use raytracer_shared::{Triangle, Sphere, Aabb, BvhNode};
+use raytracer_shared::{Triangle, Aabb, BvhNode};
 
 // Type aliases for specific f32 3D types
 type Point3f = nalgebra::Point3<f32>;

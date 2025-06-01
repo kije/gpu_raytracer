@@ -1,4 +1,3 @@
-use spirv_std::float::{f32_to_f16, f16_to_f32, vec2_to_f16x2};
 use spirv_std::glam::{vec2, vec3, Vec3, UVec2};
 use spirv_std::num_traits::Float;
 use raytracer_shared::PushConstants;
@@ -24,27 +23,19 @@ impl Ray {
         let width = push_constants.resolution[0] as u32;
         let height = push_constants.resolution[1] as u32;
 
-        // Convert screen coordinates to camera ray using f16 for better memory efficiency
-        let uv_f32 = vec2(
+        // Convert screen coordinates to camera ray with full precision
+        let uv = vec2(
             (pixel_coords.x as f32 + 0.5) / width as f32,
             (pixel_coords.y as f32 + 0.5) / height as f32
         );
-        
-        // Pack UV coordinates into f16 for potential performance benefits
-        let _uv_f16_packed = vec2_to_f16x2(uv_f32);
-        let uv = uv_f32; // Use f32 for camera calculations to maintain precision
 
-        // Convert UV coordinates to camera space
+        // Convert UV coordinates to camera space with full f32 precision
         let aspect_ratio = width as f32 / height as f32;
         let fov_scale = (push_constants.camera.fov * 0.5 * core::f32::consts::PI / 180.0).tan();
 
-        // Use f16 for intermediate screen space calculations where precision allows
-        let camera_x_f16 = f32_to_f16((uv.x * 2.0 - 1.0) * aspect_ratio * fov_scale);
-        let camera_y_f16 = f32_to_f16((1.0 - uv.y * 2.0) * fov_scale);
-        
-        // Convert back to f32 for final ray direction calculation
-        let camera_x = f16_to_f32(camera_x_f16);
-        let camera_y = f16_to_f32(camera_y_f16);
+        // Calculate camera space coordinates directly with f32 precision
+        let camera_x = (uv.x * 2.0 - 1.0) * aspect_ratio * fov_scale;
+        let camera_y = (1.0 - uv.y * 2.0) * fov_scale;
 
         // Calculate camera right and up vectors
         let forward = vec3(push_constants.camera.direction[0], push_constants.camera.direction[1], push_constants.camera.direction[2]);

@@ -25,11 +25,21 @@ pub struct BufferManager {
     pub triangle_indices_capacity: usize,
     
     // Dirty tracking
-    scene_metadata_dirty: bool,
-    triangles_dirty: bool,
-    materials_dirty: bool,
-    textures_dirty: bool,
-    texture_data_dirty: bool,
+    pub scene_metadata_dirty: bool,
+    pub triangles_dirty: bool,
+    pub materials_dirty: bool,
+    pub textures_dirty: bool,
+    pub texture_data_dirty: bool,
+    
+    // Change tracking for incremental updates
+    last_spheres_count: usize,
+    last_lights_count: usize,
+    last_bvh_nodes_count: usize,
+    last_triangle_indices_count: usize,
+    last_triangles_count: usize,
+    last_materials_count: usize,
+    last_textures_count: usize,
+    last_texture_data_len: usize,
 }
 
 impl BufferManager {
@@ -40,13 +50,20 @@ impl BufferManager {
         MAX_BUFFER_SIZE / TRIANGLE_SIZE
     }
     
-    /// Get triangle buffer by index, or the first buffer if index is out of bounds
-    pub fn get_triangle_buffer(&self, index: usize) -> &wgpu::Buffer {
-        self.triangle_buffers.get(index).unwrap_or(&self.triangle_buffers[0])
+    /// Get triangle buffer by index with proper bounds checking
+    pub fn get_triangle_buffer(&self, index: usize) -> Option<&wgpu::Buffer> {
+        self.triangle_buffers.get(index)
+    }
+    
+    /// Get triangle buffer by index, or return an error if invalid
+    pub fn get_triangle_buffer_checked(&self, index: usize) -> Result<&wgpu::Buffer, String> {
+        self.triangle_buffers.get(index)
+            .ok_or_else(|| format!("Triangle buffer index {} out of bounds (have {})", index, self.triangle_buffers.len()))
     }
 
     pub fn new(device: &wgpu::Device) -> Self {
         let spheres_capacity = RaytracerConfig::DEFAULT_MAX_SPHERES;
+        // fixme add also to RaytracerConfig
         let lights_capacity = 32; // Default lights capacity
         let bvh_nodes_capacity = 256; // Default BVH nodes capacity
         let triangle_indices_capacity = 1024; // Default triangle indices capacity
@@ -119,10 +136,18 @@ impl BufferManager {
             materials_dirty: true,
             textures_dirty: true,
             texture_data_dirty: true,
+            last_spheres_count: 0,
+            last_lights_count: 0,
+            last_bvh_nodes_count: 0,
+            last_triangle_indices_count: 0,
+            last_triangles_count: 0,
+            last_materials_count: 0,
+            last_textures_count: 0,
+            last_texture_data_len: 0,
         }
     }
     
-    /// Update scene metadata buffer with spheres, lights, BVH nodes, and triangle indices
+    /// Update scene metadata buffer with incremental updates for spheres, lights, BVH nodes, and triangle indices
     pub fn update_scene_metadata(
         &mut self, 
         device: &wgpu::Device, 
@@ -139,6 +164,14 @@ impl BufferManager {
         
         let total_size = spheres_size + lights_size + bvh_nodes_size + triangle_indices_size;
         let needs_resize = total_size > self.scene_metadata_capacity;
+        
+        // Check if data actually changed for incremental updates
+        let spheres_changed = spheres.len() != self.last_spheres_count;
+        let lights_changed = lights.len() != self.last_lights_count;
+        let bvh_nodes_changed = bvh_nodes.len() != self.last_bvh_nodes_count;
+        let triangle_indices_changed = triangle_indices.len() != self.last_triangle_indices_count;
+        
+        let any_changed = spheres_changed || lights_changed || bvh_nodes_changed || triangle_indices_changed;
         
         if needs_resize {
             // Double the capacity to accommodate growth  
@@ -164,24 +197,25 @@ impl BufferManager {
                      self.scene_metadata_capacity as f64 / (1024.0 * 1024.0));
         }
         
-        if self.scene_metadata_dirty || needs_resize {
+        // Only update if dirty flag is set OR data actually changed OR buffer was resized
+        if self.scene_metadata_dirty || needs_resize || any_changed {
             let mut combined_data = Vec::new();
             let mut offset_in_bytes = 0;
             
             // Track offsets in u32 units for shader access
-            let spheres_offset_u32 = offset_in_bytes / 4;
+            let _spheres_offset_u32 = offset_in_bytes / 4;
             combined_data.extend_from_slice(bytemuck::cast_slice(spheres));
             offset_in_bytes += spheres_size;
             
-            let lights_offset_u32 = offset_in_bytes / 4;
+            let _lights_offset_u32 = offset_in_bytes / 4;
             combined_data.extend_from_slice(bytemuck::cast_slice(lights));
             offset_in_bytes += lights_size;
             
-            let bvh_nodes_offset_u32 = offset_in_bytes / 4;
+            let _bvh_nodes_offset_u32 = offset_in_bytes / 4;
             combined_data.extend_from_slice(bytemuck::cast_slice(bvh_nodes));
             offset_in_bytes += bvh_nodes_size;
             
-            let triangle_indices_offset_u32 = offset_in_bytes / 4;
+            let _triangle_indices_offset_u32 = offset_in_bytes / 4;
             combined_data.extend_from_slice(bytemuck::cast_slice(triangle_indices));
             
             queue.write_buffer(
@@ -191,10 +225,21 @@ impl BufferManager {
             );
             
             self.scene_metadata_dirty = false;
+            
+            // Update change tracking
+            self.last_spheres_count = spheres.len();
+            self.last_lights_count = lights.len();
+            self.last_bvh_nodes_count = bvh_nodes.len();
+            self.last_triangle_indices_count = triangle_indices.len();
+            
+            if any_changed && !needs_resize {
+                println!("Incremental scene metadata update: {} spheres, {} lights, {} BVH nodes, {} triangle indices",
+                         spheres.len(), lights.len(), bvh_nodes.len(), triangle_indices.len());
+            }
         }
         
         let offsets = SceneMetadataOffsets::new(
-            (0) as u32, // spheres always start at offset 0
+            0, // spheres always start at offset 0
             spheres.len() as u32,
             (spheres_size / 4) as u32, // lights offset in u32 units
             lights.len() as u32,
@@ -241,8 +286,11 @@ impl BufferManager {
                      (std::mem::size_of::<Triangle>() * self.total_triangles_capacity) as f64 / (1024.0 * 1024.0));
         }
         
-        // Distribute triangles across buffers if dirty or resized
-        if self.triangles_dirty || needs_resize {
+        // Check if data actually changed for incremental updates
+        let triangles_changed = triangles.len() != self.last_triangles_count;
+        
+        // Distribute triangles across buffers if dirty flag is set OR data changed OR buffer was resized
+        if self.triangles_dirty || needs_resize || triangles_changed {
             for (buffer_index, buffer) in self.triangle_buffers.iter().enumerate() {
                 let start_triangle = buffer_index * self.triangles_per_buffer;
                 let end_triangle = std::cmp::min(start_triangle + self.triangles_per_buffer, triangles.len());
@@ -257,6 +305,13 @@ impl BufferManager {
                 }
             }
             self.triangles_dirty = false;
+            
+            // Update change tracking
+            self.last_triangles_count = triangles.len();
+            
+            if triangles_changed && !needs_resize {
+                println!("Incremental triangles update: {} triangles", triangles.len());
+            }
         }
         
         needs_resize
@@ -280,13 +335,24 @@ impl BufferManager {
             println!("Resized materials buffer to capacity: {}", self.materials_capacity);
         }
         
-        if self.materials_dirty || needs_resize {
+        // Check if data actually changed for incremental updates
+        let materials_changed = materials.len() != self.last_materials_count;
+        
+        // Only update if dirty flag is set OR data actually changed OR buffer was resized
+        if self.materials_dirty || needs_resize || materials_changed {
             queue.write_buffer(
                 &self.materials_buffer,
                 0,
                 bytemuck::cast_slice(materials),
             );
             self.materials_dirty = false;
+            
+            // Update change tracking
+            self.last_materials_count = materials.len();
+            
+            if materials_changed && !needs_resize {
+                println!("Incremental materials update: {} materials", materials.len());
+            }
         }
         
         needs_resize
@@ -311,13 +377,24 @@ impl BufferManager {
             println!("Resized textures buffer to capacity: {}", self.textures_capacity);
         }
         
-        if self.textures_dirty || needs_resize {
+        // Check if data actually changed for incremental updates
+        let textures_changed = textures.len() != self.last_textures_count;
+        
+        // Only update if dirty flag is set OR data actually changed OR buffer was resized
+        if self.textures_dirty || needs_resize || textures_changed {
             queue.write_buffer(
                 &self.textures_buffer,
                 0,
                 bytemuck::cast_slice(textures),
             );
             self.textures_dirty = false;
+            
+            // Update change tracking
+            self.last_textures_count = textures.len();
+            
+            if textures_changed && !needs_resize {
+                println!("Incremental textures update: {} textures", textures.len());
+            }
         }
         
         needs_resize
@@ -351,13 +428,24 @@ impl BufferManager {
             println!("Resized texture data buffer to capacity: {} u32s", self.texture_data_capacity);
         }
         
-        if self.texture_data_dirty || needs_resize {
+        // Check if data actually changed for incremental updates
+        let texture_data_changed = texture_data.len() != self.last_texture_data_len;
+        
+        // Only update if dirty flag is set OR data actually changed OR buffer was resized
+        if self.texture_data_dirty || needs_resize || texture_data_changed {
             queue.write_buffer(
                 &self.texture_data_buffer,
                 0,
                 bytemuck::cast_slice(&packed_data),
             );
             self.texture_data_dirty = false;
+            
+            // Update change tracking
+            self.last_texture_data_len = texture_data.len();
+            
+            if texture_data_changed && !needs_resize {
+                println!("Incremental texture data update: {} bytes", texture_data.len());
+            }
         }
         
         needs_resize

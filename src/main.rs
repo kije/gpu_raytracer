@@ -23,14 +23,78 @@ use scene::SceneState;
 use buffers::BufferManager;
 use compute::ComputeRenderer;
 
-/// Main application state
-struct State {
+/// Graphics and GPU management
+struct GraphicsManager {
     render: RenderState,
-    buffers: BufferManager,
-    scene: SceneState,
     progressive: ProgressiveState,
-    input: InputState,
     performance: PerformanceState,
+}
+
+impl GraphicsManager {
+    fn new(render: RenderState, progressive: ProgressiveState, performance: PerformanceState) -> Self {
+        Self { render, progressive, performance }
+    }
+    
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>, buffers: &BufferManager) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.render.resize(new_size);
+            self.progressive.resize(new_size.width, new_size.height);
+            self.render.recreate_bind_groups(buffers);
+        }
+    }
+    
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.performance.update_frame_count();
+        self.render.render()
+    }
+}
+
+/// Scene and content management
+struct ContentManager {
+    scene: SceneState,
+    buffers: BufferManager,
+}
+
+impl ContentManager {
+    fn new(scene: SceneState, buffers: BufferManager) -> Self {
+        Self { scene, buffers }
+    }
+    
+    fn load_gltf(&mut self, path: &str) -> Result<(), gltf_loader::GltfError> {
+        self.scene.replace_with_gltf(path)?;
+        self.buffers.mark_scene_metadata_dirty();
+        self.buffers.mark_triangles_dirty();
+        self.buffers.mark_materials_dirty();
+        self.buffers.mark_textures_dirty();
+        self.buffers.mark_texture_data_dirty();
+        Ok(())
+    }
+}
+
+/// User interaction management
+struct InteractionManager {
+    input: InputState,
+}
+
+impl InteractionManager {
+    fn new(input: InputState) -> Self {
+        Self { input }
+    }
+    
+    fn handle_mouse_input(&mut self, button: MouseButton, button_state: ElementState) {
+        self.input.handle_mouse_input(button, button_state);
+    }
+    
+    fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) -> Option<(f64, f64)> {
+        self.input.handle_cursor_moved(position)
+    }
+}
+
+/// Main application state coordinator
+struct State {
+    graphics: GraphicsManager,
+    content: ContentManager,
+    interaction: InteractionManager,
 }
 
 impl State {
@@ -59,35 +123,28 @@ impl State {
         render.recreate_bind_groups(&buffers);
 
         Self {
-            render,
-            buffers,
-            scene,
-            progressive,
-            input,
-            performance,
+            graphics: GraphicsManager::new(render, progressive, performance),
+            content: ContentManager::new(scene, buffers),
+            interaction: InteractionManager::new(input),
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.render.resize(new_size);
-            self.progressive.resize(new_size.width, new_size.height);
-            self.render.recreate_bind_groups(&self.buffers);
-        }
+        self.graphics.resize(new_size, &self.content.buffers);
     }
 
     fn run_compute(&mut self) {
         ComputeRenderer::run_compute(
-            &mut self.render,
-            &mut self.buffers,
-            &self.scene,
-            &mut self.progressive,
-            &mut self.performance,
+            &mut self.graphics.render,
+            &mut self.content.buffers,
+            &self.content.scene,
+            &mut self.graphics.progressive,
+            &mut self.graphics.performance,
         );
     }
 
     fn trigger_recompute(&mut self) {
-        self.progressive.trigger_recompute();
+        self.graphics.progressive.trigger_recompute();
     }
 
     fn handle_keyboard(&mut self, key: VirtualKeyCode) {
@@ -96,32 +153,27 @@ impl State {
                 self.trigger_recompute();
             }
             VirtualKeyCode::W => {
-                CameraController::move_camera(&mut self.scene.camera, 1.0, 0.0);
+                CameraController::move_camera(&mut self.content.scene.camera, 1.0, 0.0);
                 self.trigger_recompute();
             }
             VirtualKeyCode::S => {
-                CameraController::move_camera(&mut self.scene.camera, -1.0, 0.0);
+                CameraController::move_camera(&mut self.content.scene.camera, -1.0, 0.0);
                 self.trigger_recompute();
             }
             VirtualKeyCode::A => {
-                CameraController::move_camera(&mut self.scene.camera, 0.0, -1.0);
+                CameraController::move_camera(&mut self.content.scene.camera, 0.0, -1.0);
                 self.trigger_recompute();
             }
             VirtualKeyCode::D => {
-                CameraController::move_camera(&mut self.scene.camera, 0.0, 1.0);
+                CameraController::move_camera(&mut self.content.scene.camera, 0.0, 1.0);
                 self.trigger_recompute();
             }
             VirtualKeyCode::L => {
                 // Try to load a glTF file
-                if let Err(e) = self.scene.replace_with_gltf("model.gltf") {
+                if let Err(e) = self.content.load_gltf("model.gltf") {
                     println!("Failed to load glTF file: {:?}", e);
                 } else {
                     self.trigger_recompute();
-                    self.buffers.mark_scene_metadata_dirty();
-                    self.buffers.mark_triangles_dirty();
-                    self.buffers.mark_materials_dirty();
-                    self.buffers.mark_textures_dirty();
-                    self.buffers.mark_texture_data_dirty();
                 }
             }
             _ => {}
@@ -129,19 +181,18 @@ impl State {
     }
 
     fn handle_mouse_input(&mut self, button: MouseButton, button_state: ElementState) {
-        self.input.handle_mouse_input(button, button_state);
+        self.interaction.handle_mouse_input(button, button_state);
     }
 
     fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
-        if let Some((delta_x, delta_y)) = self.input.handle_cursor_moved(position) {
-            CameraController::rotate_camera(&mut self.scene.camera, delta_x, delta_y);
+        if let Some((delta_x, delta_y)) = self.interaction.handle_cursor_moved(position) {
+            CameraController::rotate_camera(&mut self.content.scene.camera, delta_x, delta_y);
             self.trigger_recompute();
         }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.performance.update_frame_count();
-        self.render.render()
+        self.graphics.render()
     }
 }
 
@@ -205,7 +256,7 @@ async fn run() {
                 state.run_compute();
                 match state.render() {
                     Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.render.size),
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.graphics.render.size),
                     Err(wgpu::SurfaceError::OutOfMemory) => control_flow.set_exit(),
                     Err(e) => eprintln!("{:?}", e),
                 }

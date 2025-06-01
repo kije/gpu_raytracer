@@ -6,10 +6,11 @@ mod bvh;
 mod lighting;
 mod material;
 mod scene_access;
+mod triangle_access;
 
 use spirv_std::spirv;
 use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec4, UVec2, Vec3};
-use raytracer_shared::{Triangle, Material, TextureInfo, PushConstants};
+use raytracer_shared::{Triangle, Material, TextureInfo, PushConstants, branchless_u32_if};
 
 use ray::Ray;
 use intersection::{Intersection, IntersectionResult};
@@ -17,6 +18,7 @@ use bvh::BvhTraverser;
 use lighting::LightingCalculator;
 use material::MaterialEvaluator;
 use scene_access::SceneAccessor;
+use triangle_access::TriangleAccessor;
 
 #[spirv(compute(threads(16, 16)))]
 pub fn main_cs(
@@ -133,16 +135,38 @@ fn find_closest_intersection(
         )
     };
 
-    // Return the closest intersection
-    if triangle_result.hit && sphere_result.hit {
-        if sphere_result.intersection.t < triangle_result.intersection.t {
-            sphere_result
-        } else {
-            triangle_result
-        }
-    } else if sphere_result.hit {
+    // Branchless closest intersection selection using comparison masks
+    let sphere_closer = branchless_u32_if!(
+        sphere_result.intersection.t < triangle_result.intersection.t,
+        1u32,
+        0u32
+    );
+    
+    let both_hit = branchless_u32_if!(
+        triangle_result.hit && sphere_result.hit,
+        1u32,
+        0u32
+    );
+    
+    let sphere_only = branchless_u32_if!(
+        sphere_result.hit && !triangle_result.hit,
+        1u32,
+        0u32
+    );
+    
+    let triangle_only = branchless_u32_if!(
+        triangle_result.hit && !sphere_result.hit,
+        1u32,
+        0u32
+    );
+    
+    // Select result branchlessly
+    let use_sphere = both_hit * sphere_closer + sphere_only;
+    let use_triangle = both_hit * (1u32 - sphere_closer) + triangle_only;
+    
+    if use_sphere != 0 {
         sphere_result
-    } else if triangle_result.hit {
+    } else if use_triangle != 0 {
         triangle_result
     } else {
         IntersectionResult::miss()
@@ -182,7 +206,7 @@ fn test_all_triangles_brute_force(
     let mut closest_t = max_t;
 
     for i in 0..push_constants.triangle_count {
-        let (triangle_valid, triangle) = get_triangle_from_buffers(i, triangles_buffer_0, triangles_buffer_1, triangles_buffer_2, push_constants);
+        let (triangle_valid, triangle) = TriangleAccessor::get_triangle_from_buffers(i, triangles_buffer_0, triangles_buffer_1, triangles_buffer_2, push_constants);
         if triangle_valid {
             let test_result = intersection::test_triangle_intersection(ray, &triangle, closest_t);
             if test_result.hit {
@@ -195,53 +219,6 @@ fn test_all_triangles_brute_force(
     result
 }
 
-/// Get triangle from multiple buffers with GPU-friendly result
-fn get_triangle_from_buffers(
-    index: u32,
-    triangles_buffer_0: &[Triangle],
-    triangles_buffer_1: &[Triangle],
-    triangles_buffer_2: &[Triangle],
-    push_constants: &PushConstants
-) -> (bool, Triangle) {
-    let buffer_index = index / push_constants.triangles_per_buffer;
-    let local_index = (index % push_constants.triangles_per_buffer) as usize;
-    
-    let default_triangle = Triangle {
-        v0: [0.0; 3],
-        _padding0: 0.0,
-        v1: [0.0; 3], 
-        _padding1: 0.0,
-        v2: [0.0; 3],
-        _padding2: 0.0,
-        material_id: 0,
-        _padding3: [0.0; 3],
-    };
-
-    match buffer_index {
-        0 => {
-            if local_index < triangles_buffer_0.len() {
-                (true, triangles_buffer_0[local_index])
-            } else {
-                (false, default_triangle)
-            }
-        },
-        1 => {
-            if local_index < triangles_buffer_1.len() {
-                (true, triangles_buffer_1[local_index])
-            } else {
-                (false, default_triangle)
-            }
-        },
-        2 => {
-            if local_index < triangles_buffer_2.len() {
-                (true, triangles_buffer_2[local_index])
-            } else {
-                (false, default_triangle)
-            }
-        },
-        _ => (false, default_triangle)
-    }
-}
 
 /// Calculate shading for an intersection
 fn calculate_shading(

@@ -2,6 +2,7 @@ use raytracer_shared::{Triangle, PushConstants};
 use crate::ray::Ray;
 use crate::intersection::{IntersectionResult, ray_aabb_intersect, test_triangle_intersection};
 use crate::scene_access::SceneAccessor;
+use crate::triangle_access::TriangleAccessor;
 
 /// BVH traverser for accelerated triangle intersection
 pub struct BvhTraverser<'a> {
@@ -111,7 +112,7 @@ impl<'a> BvhTraverser<'a> {
             
             let triangle_index = self.scene_accessor.get_triangle_index(triangle_start + i);
             
-            let (triangle_valid, triangle) = self.get_triangle_from_buffers(
+            let (triangle_valid, triangle) = TriangleAccessor::get_triangle_from_buffers(
                 triangle_index,
                 triangles_buffer_0,
                 triangles_buffer_1,
@@ -130,52 +131,4 @@ impl<'a> BvhTraverser<'a> {
         result
     }
 
-    /// Get triangle from the appropriate buffer with GPU-friendly result
-    fn get_triangle_from_buffers(
-        &self,
-        triangle_index: u32,
-        triangles_buffer_0: &[Triangle],
-        triangles_buffer_1: &[Triangle],
-        triangles_buffer_2: &[Triangle],
-        push_constants: &PushConstants
-    ) -> (bool, Triangle) {
-        let buffer_index = triangle_index / push_constants.triangles_per_buffer;
-        let local_index = (triangle_index % push_constants.triangles_per_buffer) as usize;
-        
-        let default_triangle = Triangle {
-            v0: [0.0; 3],
-            _padding0: 0.0,
-            v1: [0.0; 3], 
-            _padding1: 0.0,
-            v2: [0.0; 3],
-            _padding2: 0.0,
-            material_id: 0,
-            _padding3: [0.0; 3],
-        };
-
-        match buffer_index {
-            0 => {
-                if local_index < triangles_buffer_0.len() {
-                    (true, triangles_buffer_0[local_index])
-                } else {
-                    (false, default_triangle)
-                }
-            },
-            1 => {
-                if local_index < triangles_buffer_1.len() {
-                    (true, triangles_buffer_1[local_index])
-                } else {
-                    (false, default_triangle)
-                }
-            },
-            2 => {
-                if local_index < triangles_buffer_2.len() {
-                    (true, triangles_buffer_2[local_index])
-                } else {
-                    (false, default_triangle)
-                }
-            },
-            _ => (false, default_triangle)
-        }
-    }
 }
