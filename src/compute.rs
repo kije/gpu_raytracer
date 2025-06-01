@@ -1,6 +1,6 @@
 use bytemuck;
 use raytracer_shared::{PushConstants, RaytracerConfig};
-use crate::renderer::{RenderState, ProgressiveState, PerformanceState};
+use crate::renderer::{RenderState, ProgressiveState, PerformanceState, TimingBreakdown, ProgressiveTiming};
 use crate::buffers::BufferManager;
 use crate::scene::SceneState;
 
@@ -8,7 +8,7 @@ use crate::scene::SceneState;
 pub struct ComputeRenderer;
 
 impl ComputeRenderer {
-    /// Run the compute shader for progressive rendering
+    /// Run the compute shader for progressive rendering with detailed timing
     pub fn run_compute(
         render: &mut RenderState,
         buffers: &mut BufferManager,
@@ -16,51 +16,84 @@ impl ComputeRenderer {
         progressive: &mut ProgressiveState,
         performance: &mut PerformanceState,
     ) {
+        let frame_start = std::time::Instant::now();
+        
         // Handle progressive rendering state
-        if !Self::handle_progressive_rendering_setup(progressive) {
+        if !Self::handle_progressive_rendering_setup(progressive, performance) {
             return;
         }
 
         let total_tiles = progressive.tiles_x * progressive.tiles_y;
-        if Self::check_rendering_completion(progressive, total_tiles) {
+        if Self::check_rendering_completion(progressive, performance, total_tiles) {
             return;
         }
 
-        let compute_start = std::time::Instant::now();
         let tiles_this_frame = Self::calculate_tiles_for_frame(progressive, total_tiles);
         
-        // Update buffers and recreate bind groups if needed
+        // Time buffer updates
+        let buffer_update_start = std::time::Instant::now();
         let metadata_offsets = Self::update_buffers_and_bind_groups(render, buffers, scene);
+        let buffer_update_time = buffer_update_start.elapsed();
         
-        // Execute compute pass for tiles
+        // Time compute submission
+        let compute_start = std::time::Instant::now();
         Self::execute_compute_pass(render, buffers, scene, progressive, performance, tiles_this_frame, metadata_offsets);
+        let compute_submission_time = compute_start.elapsed();
         
-        // Update performance metrics and progress
-        Self::update_progress_and_performance(progressive, performance, compute_start, tiles_this_frame, total_tiles);
+        let total_frame_time = frame_start.elapsed();
+        
+        // Update performance metrics with detailed timing breakdown
+        Self::update_performance_with_timing(
+            progressive, performance, tiles_this_frame, total_tiles,
+            buffer_update_time, compute_submission_time, total_frame_time
+        );
     }
 
-    /// Setup progressive rendering if needed
-    fn handle_progressive_rendering_setup(progressive: &mut ProgressiveState) -> bool {
+    /// Setup progressive rendering if needed and initialize timing
+    fn handle_progressive_rendering_setup(progressive: &mut ProgressiveState, performance: &mut PerformanceState) -> bool {
         if progressive.needs_recompute && !progressive.is_progressive_rendering {
             progressive.is_progressive_rendering = true;
             progressive.current_tile = 0;
             progressive.progressive_start_time = std::time::Instant::now();
             progressive.needs_recompute = false;
             
-            println!("Starting parallel progressive render: {}x{} tiles, {} tiles per frame", 
-                     progressive.tiles_x, progressive.tiles_y, progressive.tiles_per_frame);
+            let total_tiles = progressive.tiles_x * progressive.tiles_y;
+            
+            // Initialize progressive timing state
+            performance.progressive_timing = Some(ProgressiveTiming {
+                start_time: std::time::Instant::now(),
+                total_tiles,
+                completed_tiles: 0,
+                total_buffer_update_time: std::time::Duration::ZERO,
+                total_compute_submission_time: std::time::Duration::ZERO,
+                tile_times: Vec::with_capacity(total_tiles as usize),
+            });
+            
+            println!("┌─────────────────────────────────────────────────────────────┐");
+            println!("│ Starting progressive render: {}x{} tiles ({} total)        │", 
+                     progressive.tiles_x, progressive.tiles_y, total_tiles);
+            println!("│ Tiles per frame: {} - Advanced timing enabled             │", 
+                     progressive.tiles_per_frame);
+            println!("│ Note: Submit=GPU queue submission time, Rate=overall speed │");
+            println!("└─────────────────────────────────────────────────────────────┘");
         }
         
         progressive.is_progressive_rendering
     }
 
-    /// Check if progressive rendering is complete
-    fn check_rendering_completion(progressive: &mut ProgressiveState, total_tiles: u32) -> bool {
+    /// Check if progressive rendering is complete and print comprehensive timing summary
+    fn check_rendering_completion(progressive: &mut ProgressiveState, performance: &mut PerformanceState, total_tiles: u32) -> bool {
         if progressive.current_tile >= total_tiles {
             progressive.is_progressive_rendering = false;
             let total_time = progressive.progressive_start_time.elapsed();
-            println!("Progressive render completed in {:.2}ms", 
-                     total_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND);
+            
+            // Print comprehensive timing summary
+            if let Some(ref prog_timing) = performance.progressive_timing {
+                Self::print_completion_summary(prog_timing, total_time, total_tiles);
+            }
+            
+            // Clear progressive timing state
+            performance.progressive_timing = None;
             return true;
         }
         false
@@ -217,22 +250,115 @@ impl ComputeRenderer {
         compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
     }
 
-    /// Update performance metrics and progress tracking
-    fn update_progress_and_performance(
+    /// Update performance metrics with detailed timing breakdown
+    fn update_performance_with_timing(
         progressive: &mut ProgressiveState,
         performance: &mut PerformanceState,
-        compute_start: std::time::Instant,
         tiles_this_frame: u32,
         total_tiles: u32,
+        buffer_update_time: std::time::Duration,
+        compute_submission_time: std::time::Duration,
+        total_frame_time: std::time::Duration,
     ) {
-        performance.last_compute_time = compute_start.elapsed();
+        // Update legacy timing for compatibility
+        performance.last_compute_time = compute_submission_time;
+        
+        // Calculate more realistic tiles per second based on progressive rendering rate
+        let realistic_tiles_per_sec = if let Some(ref prog_timing) = performance.progressive_timing {
+            let elapsed_since_start = prog_timing.start_time.elapsed().as_secs_f32();
+            if elapsed_since_start > 0.0 {
+                prog_timing.completed_tiles as f32 / elapsed_since_start
+            } else {
+                0.0
+            }
+        } else {
+            // Fallback to frame-based calculation (less accurate)
+            if total_frame_time.as_secs_f32() > 0.0 {
+                tiles_this_frame as f32 / total_frame_time.as_secs_f32()
+            } else {
+                0.0
+            }
+        };
+
+        // Update detailed timing breakdown
+        performance.last_timing_breakdown = TimingBreakdown {
+            buffer_update_time,
+            compute_submission_time,
+            total_frame_time,
+            tiles_processed: tiles_this_frame,
+            tiles_per_second: realistic_tiles_per_sec,
+        };
+        
+        // Update progressive timing state
+        if let Some(ref mut prog_timing) = performance.progressive_timing {
+            prog_timing.completed_tiles += tiles_this_frame;
+            prog_timing.total_buffer_update_time += buffer_update_time;
+            prog_timing.total_compute_submission_time += compute_submission_time;
+            prog_timing.tile_times.push(total_frame_time);
+        }
+        
         progressive.current_tile += tiles_this_frame;
         
-        // Progress feedback
+        // Enhanced progress feedback with timing details
         if progressive.current_tile % progressive.tiles_per_frame == 0 || progressive.current_tile == total_tiles {
             let progress = (progressive.current_tile as f32 / total_tiles as f32) * RaytracerConfig::PROGRESS_PERCENTAGE_SCALE;
-            println!("Progress: {:.1}% ({}/{}) - {} tiles/frame", 
-                     progress, progressive.current_tile, total_tiles, tiles_this_frame);
+            let timing = &performance.last_timing_breakdown;
+            
+            println!("Progress: {:.1}% ({}/{}) │ Buffer: {:.2}ms │ Submit: {:.2}ms │ Frame: {:.2}ms │ Rate: {:.1} tiles/sec", 
+                progress, 
+                progressive.current_tile, 
+                total_tiles,
+                timing.buffer_update_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                timing.compute_submission_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                timing.total_frame_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                timing.tiles_per_second
+            );
         }
+    }
+    
+    /// Print comprehensive timing summary when rendering completes
+    fn print_completion_summary(
+        prog_timing: &ProgressiveTiming, 
+        total_time: std::time::Duration, 
+        total_tiles: u32
+    ) {
+        let total_secs = total_time.as_secs_f32();
+        let avg_buffer_time = prog_timing.total_buffer_update_time.as_secs_f32() / total_tiles as f32;
+        let avg_compute_time = prog_timing.total_compute_submission_time.as_secs_f32() / total_tiles as f32;
+        let overall_tiles_per_sec = total_tiles as f32 / total_secs;
+        
+        // Calculate percentile timings
+        let mut frame_times: Vec<f32> = prog_timing.tile_times.iter()
+            .map(|d| d.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND)
+            .collect();
+        frame_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        let p50 = frame_times.get(frame_times.len() / 2).unwrap_or(&0.0);
+        let p95 = frame_times.get((frame_times.len() * 95) / 100).unwrap_or(&0.0);
+        let p99 = frame_times.get((frame_times.len() * 99) / 100).unwrap_or(&0.0);
+        
+        println!("┌─────────────────────────────────────────────────────────────┐");
+        println!("│ Progressive Rendering Complete - Timing Summary            │");
+        println!("├─────────────────────────────────────────────────────────────┤");
+        println!("│ Total Time: {:.2}s │ Tiles: {} │ Rate: {:.1} tiles/sec      │", 
+                 total_secs, total_tiles, overall_tiles_per_sec);
+        println!("├─────────────────────────────────────────────────────────────┤");
+        println!("│ Average Times per Tile:                                    │");
+        println!("│  • Buffer Updates: {:.3}ms                                 │", 
+                 avg_buffer_time * RaytracerConfig::MILLISECONDS_PER_SECOND);
+        println!("│  • Compute Submit: {:.3}ms                                 │", 
+                 avg_compute_time * RaytracerConfig::MILLISECONDS_PER_SECOND);
+        println!("│  • Total Buffer:   {:.2}ms ({:.1}% of total)               │", 
+                 prog_timing.total_buffer_update_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                 (prog_timing.total_buffer_update_time.as_secs_f32() / total_secs) * 100.0);
+        println!("│  • Total Compute:  {:.2}ms ({:.1}% of total)               │", 
+                 prog_timing.total_compute_submission_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                 (prog_timing.total_compute_submission_time.as_secs_f32() / total_secs) * 100.0);
+        println!("├─────────────────────────────────────────────────────────────┤");
+        println!("│ Frame Time Percentiles:                                    │");
+        println!("│  • P50 (median): {:.2}ms                                   │", p50);
+        println!("│  • P95:          {:.2}ms                                   │", p95);
+        println!("│  • P99:          {:.2}ms                                   │", p99);
+        println!("└─────────────────────────────────────────────────────────────┘");
     }
 }

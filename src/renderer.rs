@@ -47,11 +47,46 @@ pub struct ProgressiveState {
     pub tiles_per_frame: u32,
 }
 
-/// Performance tracking
+/// Detailed timing breakdown for performance analysis
+#[derive(Debug, Clone)]
+pub struct TimingBreakdown {
+    pub buffer_update_time: std::time::Duration,
+    pub compute_submission_time: std::time::Duration,
+    pub total_frame_time: std::time::Duration,
+    pub tiles_processed: u32,
+    pub tiles_per_second: f32,
+}
+
+impl TimingBreakdown {
+    pub fn new() -> Self {
+        Self {
+            buffer_update_time: std::time::Duration::ZERO,
+            compute_submission_time: std::time::Duration::ZERO,
+            total_frame_time: std::time::Duration::ZERO,
+            tiles_processed: 0,
+            tiles_per_second: 0.0,
+        }
+    }
+}
+
+/// Enhanced performance tracking with detailed timing breakdown
 pub struct PerformanceState {
     pub start_time: std::time::Instant,
     pub last_compute_time: std::time::Duration,
     pub frame_count: u64,
+    pub last_timing_breakdown: TimingBreakdown,
+    pub progressive_timing: Option<ProgressiveTiming>,
+}
+
+/// Progressive rendering timing state
+#[derive(Debug, Clone)]
+pub struct ProgressiveTiming {
+    pub start_time: std::time::Instant,
+    pub total_tiles: u32,
+    pub completed_tiles: u32,
+    pub total_buffer_update_time: std::time::Duration,
+    pub total_compute_submission_time: std::time::Duration,
+    pub tile_times: Vec<std::time::Duration>, // Individual tile submission times
 }
 
 impl RenderState {
@@ -825,19 +860,34 @@ impl PerformanceState {
             start_time: std::time::Instant::now(),
             last_compute_time: std::time::Duration::ZERO,
             frame_count: 0,
+            last_timing_breakdown: TimingBreakdown::new(),
+            progressive_timing: None,
         }
     }
 
     pub fn update_frame_count(&mut self) {
         self.frame_count += 1;
         
-        // Print performance stats every 60 frames
+        // Print performance stats every 60 frames with enhanced timing details
         if self.frame_count % RaytracerConfig::PERFORMANCE_STATS_INTERVAL == 0 {
             let elapsed = self.start_time.elapsed().as_secs_f32();
             let fps = self.frame_count as f32 / elapsed;
-            println!("FPS: {:.1}, Last compute: {:.2}ms", 
-                     fps, 
-                     self.last_compute_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND);
+            let timing = &self.last_timing_breakdown;
+            
+            // Only show detailed timing if we have meaningful data (tiles processed > 0)
+            if timing.tiles_processed > 0 {
+                println!("FPS: {:.1} │ Tiles/sec: {:.1} │ Buffer: {:.2}ms │ Compute: {:.2}ms │ Frame: {:.2}ms", 
+                         fps,
+                         timing.tiles_per_second,
+                         timing.buffer_update_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                         timing.compute_submission_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND,
+                         timing.total_frame_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND);
+            } else {
+                // Fallback to legacy timing when not actively rendering
+                println!("FPS: {:.1}, Last compute: {:.2}ms", 
+                         fps, 
+                         self.last_compute_time.as_secs_f32() * RaytracerConfig::MILLISECONDS_PER_SECOND);
+            }
         }
     }
 }
