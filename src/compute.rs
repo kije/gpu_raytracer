@@ -70,7 +70,6 @@ impl ComputeRenderer {
             });
 
             compute_pass.set_pipeline(&render.compute_pipeline);
-            compute_pass.set_bind_group(0, &render.compute_bind_group, &[]);
 
             // Process multiple tiles in parallel
             for i in 0..tiles_this_frame {
@@ -85,24 +84,31 @@ impl ComputeRenderer {
                 let actual_tile_width = std::cmp::min(RaytracerConfig::TILE_SIZE, render.size.width - tile_offset_x);
                 let actual_tile_height = std::cmp::min(RaytracerConfig::TILE_SIZE, render.size.height - tile_offset_y);
                 
-                let push_constants = PushConstants::new(
-                    [render.size.width as f32, render.size.height as f32],
-                    performance.start_time.elapsed().as_secs_f32(),
-                    scene.camera,
-                    scene.triangles.len() as u32,
-                    scene.materials.len() as u32,
-                    [tile_offset_x, tile_offset_y],
-                    [actual_tile_width, actual_tile_height],
-                    [progressive.tiles_x, progressive.tiles_y],
-                    buffers.triangles_per_buffer as u32,
-                    metadata_offsets,
-                );
-                compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
+                // Process all three color channels for each tile
+                for color_channel in 0..3 {
+                    // Set the appropriate bind group for this color channel
+                    compute_pass.set_bind_group(0, render.get_compute_bind_group(color_channel), &[]);
+                    
+                    let push_constants = PushConstants::new(
+                        [render.size.width as f32, render.size.height as f32],
+                        performance.start_time.elapsed().as_secs_f32(),
+                        scene.camera,
+                        scene.triangles.len() as u32,
+                        scene.materials.len() as u32,
+                        [tile_offset_x, tile_offset_y],
+                        [actual_tile_width, actual_tile_height],
+                        [progressive.tiles_x, progressive.tiles_y],
+                        buffers.triangles_per_buffer as u32,
+                        metadata_offsets,
+                        color_channel,
+                    );
+                    compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
 
-                // Dispatch workgroups for current tile
-                let workgroup_x = (actual_tile_width + RaytracerConfig::THREAD_GROUP_SIZE.0 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.0;
-                let workgroup_y = (actual_tile_height + RaytracerConfig::THREAD_GROUP_SIZE.1 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.1;
-                compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                    // Dispatch workgroups for current tile and channel
+                    let workgroup_x = (actual_tile_width + RaytracerConfig::THREAD_GROUP_SIZE.0 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.0;
+                    let workgroup_y = (actual_tile_height + RaytracerConfig::THREAD_GROUP_SIZE.1 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.1;
+                    compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+                }
             }
         }
 

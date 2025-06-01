@@ -37,6 +37,22 @@ impl<'a> MaterialEvaluator<'a> {
         f16_to_f32(self.material.ior_transmission_f16 & 0xFFFF) // Low 16 bits
     }
 
+    /// Get wavelength-dependent IOR for chromatic aberration
+    /// channel: 0=red, 1=green, 2=blue
+    pub fn ior_for_channel(&self, channel: u32) -> f32 {
+        let base_ior = self.ior();
+        
+        // Apply wavelength-dependent dispersion (Cauchy equation approximation)
+        // Red: ~650nm, Green: ~540nm, Blue: ~450nm
+        // Using simplified dispersion formula: n(λ) = A + B/λ²
+        match channel {
+            0 => base_ior - 0.02, // Red (less dispersion)
+            1 => base_ior,        // Green (reference)
+            2 => base_ior + 0.04, // Blue (more dispersion)
+            _ => base_ior,        // Fallback
+        }
+    }
+
     /// Get transmission factor (converted from packed f16)
     pub fn transmission(&self) -> f32 {
         f16_to_f32(self.material.ior_transmission_f16 >> 16) // High 16 bits

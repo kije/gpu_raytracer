@@ -56,15 +56,18 @@ pub fn main_cs(
         push_constants
     );
     
-    // Calculate final color
+    // Calculate final color based on color channel
     let final_color = if intersection_result.hit {
         calculate_shading(&intersection_result.intersection, &camera_ray, &scene_accessor, materials, push_constants)
     } else {
         vec3(0.0, 0.0, 0.0) // Sky color
     };
     
+    // Filter color by channel for chromatic aberration
+    let channel_filtered_color = filter_color_by_channel(final_color, push_constants.color_channel);
+    
     // Write to output
-    let output_color = vec4(final_color.x, final_color.y, final_color.z, 1.0);
+    let output_color = vec4(channel_filtered_color.x, channel_filtered_color.y, channel_filtered_color.z, 1.0);
     unsafe {
         output_image.write(UVec2::new(pixel_coords.x, pixel_coords.y), output_color);
     }
@@ -263,11 +266,33 @@ fn calculate_shading(
         push_constants
     );
 
-    // Apply transmission
+    // Apply transmission with wavelength-dependent refraction for chromatic aberration
     let transmission_factor = material_eval.transmission().max(0.0).min(1.0);
-    let transmitted_color = vec3(0.2, 0.2, 0.3);
     
-    lighting * (1.0 - transmission_factor) + transmitted_color * transmission_factor
+    // Calculate color contribution based on wavelength-dependent IOR
+    if transmission_factor > 0.0 {
+        let wavelength_ior = material_eval.ior_for_channel(push_constants.color_channel);
+        
+        // Simple chromatic dispersion simulation
+        // Higher IOR means more bending, which affects color intensity
+        let dispersion_factor = (wavelength_ior - 1.0) / (material_eval.ior() - 1.0);
+        let transmitted_color = vec3(0.2, 0.2, 0.3) * dispersion_factor;
+        
+        lighting * (1.0 - transmission_factor) + transmitted_color * transmission_factor
+    } else {
+        lighting
+    }
+}
+
+/// Filter color by channel for chromatic aberration
+/// Returns color for only the specified channel (0=red, 1=green, 2=blue)
+fn filter_color_by_channel(color: Vec3, channel: u32) -> Vec3 {
+    match channel {
+        0 => vec3(color.x, 0.0, 0.0), // Red channel only
+        1 => vec3(0.0, color.y, 0.0), // Green channel only  
+        2 => vec3(0.0, 0.0, color.z), // Blue channel only
+        _ => color, // Fallback to full color
+    }
 }
 
 // Vertex shader for fullscreen quad
@@ -285,13 +310,29 @@ pub fn main_vs(
     *uv = vec2((x + 1.0) * 0.5, 1.0 - (y + 1.0) * 0.5);
 }
 
-// Fragment shader to display raytraced texture
+// Fragment shader to combine and display 3 chromatic aberration textures
 #[spirv(fragment)]
 pub fn main_fs(
     uv: Vec2,
-    #[spirv(descriptor_set = 0, binding = 0)] texture: &spirv_std::image::Image!(2D, type=f32, sampled),
-    #[spirv(descriptor_set = 0, binding = 1)] sampler: &spirv_std::Sampler,
+    #[spirv(descriptor_set = 0, binding = 0)] texture_red: &spirv_std::image::Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 1)] texture_green: &spirv_std::image::Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 2)] texture_blue: &spirv_std::image::Image!(2D, type=f32, sampled),
+    #[spirv(descriptor_set = 0, binding = 3)] sampler: &spirv_std::Sampler,
     output: &mut Vec4,
 ) {
-    *output = texture.sample(*sampler, uv);
+    // Sample each color channel texture
+    let red_sample = texture_red.sample(*sampler, uv);
+    let green_sample = texture_green.sample(*sampler, uv);
+    let blue_sample = texture_blue.sample(*sampler, uv);
+    
+    // Combine RGB channels into final color
+    // Each texture contains the filtered color for that channel, so we extract the relevant component
+    let final_color = vec4(
+        red_sample.x,    // Red component from red channel texture
+        green_sample.y,  // Green component from green channel texture
+        blue_sample.z,   // Blue component from blue channel texture
+        1.0              // Alpha channel
+    );
+    
+    *output = final_color;
 }

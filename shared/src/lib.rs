@@ -158,7 +158,8 @@ pub struct PushConstants {
     pub total_tiles: [u32; 2],
     pub triangles_per_buffer: u32, // Triangles per buffer for multi-buffer access
     pub metadata_offsets: SceneMetadataOffsets, // Combined scene metadata offsets
-    pub _padding: [u32; 2],        // Padding for alignment
+    pub color_channel: u32,        // 0=red, 1=green, 2=blue for chromatic aberration
+    pub _padding: [u32; 1],        // Padding for alignment
 }
 
 impl Camera {
@@ -582,6 +583,7 @@ impl PushConstants {
         total_tiles: [u32; 2],
         triangles_per_buffer: u32,
         metadata_offsets: SceneMetadataOffsets,
+        color_channel: u32,
     ) -> Self {
         Self {
             resolution,
@@ -594,7 +596,8 @@ impl PushConstants {
             total_tiles,
             triangles_per_buffer,
             metadata_offsets,
-            _padding: [0; 2],
+            color_channel,
+            _padding: [0; 1],
         }
     }
 }
@@ -855,11 +858,13 @@ mod test {
             [15, 8],
             100,
             metadata,
+            0, // red channel
         );
         
         assert_eq!(constants.metadata_offsets.bvh_nodes_count, 50);
         assert_eq!(constants.triangle_count, 20);
         assert_eq!(constants.metadata_offsets.spheres_count, 10);
         assert_eq!(constants.metadata_offsets.lights_count, 2);
+        assert_eq!(constants.color_channel, 0);
     }
 }

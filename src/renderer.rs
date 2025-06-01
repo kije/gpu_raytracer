@@ -16,12 +16,16 @@ pub struct RenderState {
     pub compute_pipeline: wgpu::ComputePipeline,
     pub render_pipeline: wgpu::RenderPipeline,
     
-    // Textures and samplers
-    pub raytraced_texture: wgpu::Texture,
+    // Textures and samplers for chromatic aberration
+    pub raytraced_texture_red: wgpu::Texture,
+    pub raytraced_texture_green: wgpu::Texture,
+    pub raytraced_texture_blue: wgpu::Texture,
     pub sampler: wgpu::Sampler,
     
     // Bind groups
-    pub compute_bind_group: wgpu::BindGroup,
+    pub compute_bind_group_red: wgpu::BindGroup,
+    pub compute_bind_group_green: wgpu::BindGroup,
+    pub compute_bind_group_blue: wgpu::BindGroup,
     pub render_bind_group: wgpu::BindGroup,
 }
 
@@ -104,9 +108,39 @@ impl RenderState {
             source: make_spirv(shader_binary),
         });
 
-        // Create texture for raytraced output
-        let raytraced_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Raytraced Texture"),
+        // Create 3 separate textures for chromatic aberration (R, G, B channels)
+        let raytraced_texture_red = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Raytraced Texture Red"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let raytraced_texture_green = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Raytraced Texture Green"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let raytraced_texture_blue = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Raytraced Texture Blue"),
             size: wgpu::Extent3d {
                 width: size.width,
                 height: size.height,
@@ -144,14 +178,56 @@ impl RenderState {
         });
 
         let compute_bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
+        
+        // Create 3 separate compute bind groups (one for each color channel)
+        let compute_bind_group_red = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group Red"),
             layout: &compute_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        &raytraced_texture_red.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
+            ],
+        });
+
+        let compute_bind_group_green = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group Green"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &raytraced_texture_green.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dummy_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: dummy_buffer.as_entire_binding() },
+            ],
+        });
+
+        let compute_bind_group_blue = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group Blue"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &raytraced_texture_blue.create_view(&wgpu::TextureViewDescriptor::default())
                     ),
                 },
                 wgpu::BindGroupEntry { binding: 1, resource: dummy_buffer.as_entire_binding() },
@@ -169,14 +245,30 @@ impl RenderState {
             label: Some("Render Bind Group"),
             layout: &render_bind_group_layout,
             entries: &[
+                // Binding 0: Red channel texture
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        &raytraced_texture_red.create_view(&wgpu::TextureViewDescriptor::default())
                     ),
                 },
+                // Binding 1: Green channel texture
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &raytraced_texture_green.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                // Binding 2: Blue channel texture
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &raytraced_texture_blue.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                // Binding 3: Sampler for all textures
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
@@ -190,9 +282,13 @@ impl RenderState {
             size,
             compute_pipeline,
             render_pipeline,
-            raytraced_texture,
+            raytraced_texture_red,
+            raytraced_texture_green,
+            raytraced_texture_blue,
             sampler,
-            compute_bind_group,
+            compute_bind_group_red,
+            compute_bind_group_green,
+            compute_bind_group_blue,
             render_bind_group,
         }
     }
@@ -295,6 +391,7 @@ impl RenderState {
         let render_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Render Bind Group Layout"),
             entries: &[
+                // Binding 0: Red channel texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -305,8 +402,31 @@ impl RenderState {
                     },
                     count: None,
                 },
+                // Binding 1: Green channel texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // Binding 2: Blue channel texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // Binding 3: Sampler for all textures
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -383,9 +503,39 @@ impl RenderState {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
-            // Recreate raytraced texture
-            self.raytraced_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Raytraced Texture"),
+            // Recreate 3 separate raytraced textures for chromatic aberration
+            self.raytraced_texture_red = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Raytraced Texture Red"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+
+            self.raytraced_texture_green = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Raytraced Texture Green"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+
+            self.raytraced_texture_blue = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Raytraced Texture Blue"),
                 size: wgpu::Extent3d {
                     width: new_size.width,
                     height: new_size.height,
@@ -402,16 +552,17 @@ impl RenderState {
     }
 
     pub fn recreate_bind_groups(&mut self, buffers: &BufferManager) {
-        // Recreate compute bind group
+        // Recreate 3 separate compute bind groups (one for each color channel)
         let compute_bind_group_layout = self.compute_pipeline.get_bind_group_layout(0);
-        self.compute_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
+        
+        self.compute_bind_group_red = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group Red"),
             layout: &compute_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &self.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        &self.raytraced_texture_red.create_view(&wgpu::TextureViewDescriptor::default())
                     ),
                 },
                 wgpu::BindGroupEntry {
@@ -445,24 +596,132 @@ impl RenderState {
             ],
         });
 
-        // Recreate render bind group
+        self.compute_bind_group_green = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group Green"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.raytraced_texture_green.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.scene_metadata_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.get_triangle_buffer(0).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffers.get_triangle_buffer(1).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buffers.get_triangle_buffer(2).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buffers.materials_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: buffers.texture_data_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.compute_bind_group_blue = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group Blue"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.raytraced_texture_blue.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.scene_metadata_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.get_triangle_buffer(0).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffers.get_triangle_buffer(1).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buffers.get_triangle_buffer(2).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buffers.materials_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: buffers.textures_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: buffers.texture_data_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Recreate render bind group with all 3 color channel textures
         let render_bind_group_layout = self.render_pipeline.get_bind_group_layout(0);
         self.render_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Render Bind Group"),
             layout: &render_bind_group_layout,
             entries: &[
+                // Binding 0: Red channel texture
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(
-                        &self.raytraced_texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        &self.raytraced_texture_red.create_view(&wgpu::TextureViewDescriptor::default())
                     ),
                 },
+                // Binding 1: Green channel texture
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.raytraced_texture_green.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                // Binding 2: Blue channel texture
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.raytraced_texture_blue.create_view(&wgpu::TextureViewDescriptor::default())
+                    ),
+                },
+                // Binding 3: Sampler for all textures
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
         });
+    }
+
+    /// Get the appropriate compute bind group for the given color channel
+    pub fn get_compute_bind_group(&self, color_channel: u32) -> &wgpu::BindGroup {
+        match color_channel {
+            0 => &self.compute_bind_group_red,
+            1 => &self.compute_bind_group_green,
+            2 => &self.compute_bind_group_blue,
+            _ => &self.compute_bind_group_red, // Fallback
+        }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
