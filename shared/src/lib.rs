@@ -10,9 +10,9 @@ use bytemuck::{Pod, Zeroable};
 #[cfg(not(target_arch = "spirv"))]
 use half::f16;
 
-// Use spirv-std for shader code when available
-#[cfg(all(target_arch = "spirv", feature = "shader"))]
-use spirv_std::float::Float;
+// Use spirv-std for shader code when available (Float trait not needed currently)
+// #[cfg(all(target_arch = "spirv", feature = "shader"))]
+// use spirv_std::float::Float;
 
 /// Configuration constants for the raytracer
 pub struct RaytracerConfig;
@@ -160,6 +160,39 @@ pub struct BvhNode {
     pub triangle_count: u32, // Number of triangles (if leaf)
 }
 
+/// Wavefront ray data for multi-bounce raytracing
+/// Each ray contains all data needed for continuation across bounce depths
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct WavefrontRay {
+    pub origin: [f32; 3],          // Ray origin (12 bytes)
+    pub ray_type: u32,             // Ray type: 0=camera, 1=reflection, 2=transmission, 3=shadow (4 bytes)
+    pub direction: [f32; 3],       // Ray direction (12 bytes)
+    pub bounce_depth: u32,         // Current bounce depth (4 bytes)
+    pub throughput: [f32; 3],      // Color throughput accumulated so far (12 bytes)
+    pub medium_ior: f32,           // IOR of the medium the ray is traveling in (4 bytes)
+    pub pixel_coord: [u32; 2],     // Original pixel coordinates (8 bytes)
+    pub inv_pdf: f32,              // Inverse probability density for importance sampling (4 bytes)
+    pub t_min: f32,                // Minimum intersection distance (4 bytes)
+    pub t_max: f32,                // Maximum intersection distance (4 bytes)
+    pub wavelength_channel: u32,   // Wavelength channel for chromatic aberration: 0=red, 1=green, 2=blue (4 bytes)
+    pub active: u32,               // 1 if ray is active, 0 if terminated (4 bytes)
+    // Total: 76 bytes per ray
+}
+
+/// Ray generation counters for wavefront raytracing
+/// Used to track ray counts per bounce depth for efficient GPU dispatch
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct WavefrontCounters {
+    pub total_rays_generated: u32,     // Total rays generated this frame
+    pub rays_per_bounce: [u32; 8],     // Ray count for each bounce depth (0-7)
+    pub active_bounce_depths: u32,     // Bitmask of active bounce depths
+    pub max_bounce_depth: u32,         // Maximum bounce depth to trace
+    pub frame_seed: u32,               // Random seed for this frame
+    pub _padding: [u32; 3],            // Padding for alignment
+}
+
 /// Scene metadata offsets for combined buffer layout
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -185,11 +218,12 @@ pub struct PushConstants {
     pub triangle_count: u32,
     pub material_count: u32,
     pub tile_offset: [u32; 2],
-    pub tile_size: [u32; 2],
+    pub tile_size_packed: u32,     // Packed: width(low 16 bits) + height(high 16 bits)
     pub total_tiles: [u32; 2],
     pub triangles_per_buffer: u32, // Triangles per buffer for multi-buffer access
     pub metadata_offsets: SceneMetadataOffsets, // Combined scene metadata offsets
-    pub color_channel: u32,        // 0=red, 1=green, 2=blue for chromatic aberration
+    pub packed_flags: u32,         // Packed: color_channel(0-7), current_bounce_depth(8-15), max_bounce_depth(16-23), wavefront_mode(24-31)
+    pub frame_seed: u32,           // Random seed for this frame
 }
 
 impl Camera {
@@ -796,6 +830,218 @@ impl BvhNode {
     }
 }
 
+impl WavefrontRay {
+    /// Create a new wavefront ray
+    pub fn new(
+        origin: [f32; 3],
+        direction: [f32; 3],
+        ray_type: u32,
+        bounce_depth: u32,
+        throughput: [f32; 3],
+        medium_ior: f32,
+        pixel_coord: [u32; 2],
+        wavelength_channel: u32,
+    ) -> Self {
+        Self {
+            origin,
+            ray_type,
+            direction,
+            bounce_depth,
+            throughput,
+            medium_ior,
+            pixel_coord,
+            inv_pdf: 1.0, // Default to uniform sampling
+            t_min: 0.001, // Small epsilon to avoid self-intersection
+            t_max: f32::MAX,
+            wavelength_channel,
+            active: 1, // Active by default
+        }
+    }
+    
+    /// Create a camera ray
+    pub fn camera_ray(
+        origin: [f32; 3],
+        direction: [f32; 3],
+        pixel_coord: [u32; 2],
+        wavelength_channel: u32,
+    ) -> Self {
+        Self::new(
+            origin,
+            direction,
+            0, // Camera ray type
+            0, // Bounce depth 0
+            [1.0, 1.0, 1.0], // Full throughput
+            1.0, // Air IOR
+            pixel_coord,
+            wavelength_channel,
+        )
+    }
+    
+    /// Create a reflection ray
+    pub fn reflection_ray(
+        origin: [f32; 3],
+        direction: [f32; 3],
+        bounce_depth: u32,
+        throughput: [f32; 3],
+        medium_ior: f32,
+        pixel_coord: [u32; 2],
+        wavelength_channel: u32,
+        inv_pdf: f32,
+    ) -> Self {
+        Self {
+            origin,
+            ray_type: 1, // Reflection ray type
+            direction,
+            bounce_depth,
+            throughput,
+            medium_ior,
+            pixel_coord,
+            inv_pdf,
+            t_min: 0.001,
+            t_max: f32::MAX,
+            wavelength_channel,
+            active: 1,
+        }
+    }
+    
+    /// Create a transmission ray
+    pub fn transmission_ray(
+        origin: [f32; 3],
+        direction: [f32; 3],
+        bounce_depth: u32,
+        throughput: [f32; 3],
+        medium_ior: f32,
+        pixel_coord: [u32; 2],
+        wavelength_channel: u32,
+        inv_pdf: f32,
+    ) -> Self {
+        Self {
+            origin,
+            ray_type: 2, // Transmission ray type
+            direction,
+            bounce_depth,
+            throughput,
+            medium_ior,
+            pixel_coord,
+            inv_pdf,
+            t_min: 0.001,
+            t_max: f32::MAX,
+            wavelength_channel,
+            active: 1,
+        }
+    }
+    
+    /// Create a shadow ray
+    pub fn shadow_ray(
+        origin: [f32; 3],
+        direction: [f32; 3],
+        t_max: f32,
+        pixel_coord: [u32; 2],
+        wavelength_channel: u32,
+    ) -> Self {
+        Self {
+            origin,
+            ray_type: 3, // Shadow ray type
+            direction,
+            bounce_depth: 0, // Shadow rays don't bounce
+            throughput: [1.0, 1.0, 1.0],
+            medium_ior: 1.0,
+            pixel_coord,
+            inv_pdf: 1.0,
+            t_min: 0.001,
+            t_max,
+            wavelength_channel,
+            active: 1,
+        }
+    }
+    
+    /// Deactivate this ray
+    pub fn deactivate(&mut self) {
+        self.active = 0;
+    }
+    
+    /// Check if ray is active
+    pub fn is_active(&self) -> bool {
+        self.active != 0
+    }
+    
+    /// Apply russian roulette termination
+    pub fn apply_russian_roulette(&mut self, continuation_probability: f32, rng_value: f32) {
+        if rng_value > continuation_probability {
+            self.deactivate();
+        } else {
+            // Boost throughput to maintain unbiased result
+            self.throughput[0] /= continuation_probability;
+            self.throughput[1] /= continuation_probability;
+            self.throughput[2] /= continuation_probability;
+        }
+    }
+}
+
+impl WavefrontCounters {
+    /// Create new wavefront counters
+    pub fn new(max_bounce_depth: u32, frame_seed: u32) -> Self {
+        Self {
+            total_rays_generated: 0,
+            rays_per_bounce: [0; 8],
+            active_bounce_depths: 0,
+            max_bounce_depth,
+            frame_seed,
+            _padding: [0; 3],
+        }
+    }
+    
+    /// Reset all counters for new frame
+    pub fn reset(&mut self, frame_seed: u32) {
+        self.total_rays_generated = 0;
+        self.rays_per_bounce = [0; 8];
+        self.active_bounce_depths = 0;
+        self.frame_seed = frame_seed;
+    }
+    
+    /// Add rays for a specific bounce depth
+    pub fn add_rays(&mut self, bounce_depth: u32, count: u32) {
+        if bounce_depth < 8 {
+            self.rays_per_bounce[bounce_depth as usize] += count;
+            self.total_rays_generated += count;
+            self.active_bounce_depths |= 1 << bounce_depth;
+        }
+    }
+    
+    /// Get ray count for specific bounce depth
+    pub fn get_ray_count(&self, bounce_depth: u32) -> u32 {
+        if bounce_depth < 8 {
+            self.rays_per_bounce[bounce_depth as usize]
+        } else {
+            0
+        }
+    }
+    
+    /// Check if bounce depth has active rays
+    pub fn has_active_rays(&self, bounce_depth: u32) -> bool {
+        if bounce_depth < 8 {
+            (self.active_bounce_depths & (1 << bounce_depth)) != 0
+        } else {
+            false
+        }
+    }
+    
+    /// Get next active bounce depth
+    pub fn next_active_bounce_depth(&self, current_depth: u32) -> Option<u32> {
+        for depth in (current_depth + 1)..=self.max_bounce_depth.min(7) {
+            if self.has_active_rays(depth) {
+                return Some(depth);
+            }
+        }
+        None
+    }
+    
+    /// Check if any bounce depths have active rays
+    pub fn has_any_active_rays(&self) -> bool {
+        self.active_bounce_depths != 0 && self.total_rays_generated > 0
+    }
+}
+
 impl SceneMetadataOffsets {
     /// Create new scene metadata offsets
     pub fn new(
@@ -839,18 +1085,97 @@ impl PushConstants {
         metadata_offsets: SceneMetadataOffsets,
         color_channel: u32,
     ) -> Self {
+        let packed_flags = Self::pack_flags(color_channel, 0, 4, 0);
         Self {
             resolution,
             camera,
             triangle_count,
             material_count,
             tile_offset,
-            tile_size,
+            tile_size_packed: Self::pack_tile_size(tile_size[0], tile_size[1]),
             total_tiles,
             triangles_per_buffer,
             metadata_offsets,
-            color_channel,
+            packed_flags,
+            frame_seed: 0,
         }
+    }
+    
+    /// Create push constants for wavefront raytracing
+    pub fn new_wavefront(
+        resolution: [f32; 2],
+        camera: Camera,
+        triangle_count: u32,
+        material_count: u32,
+        tile_offset: [u32; 2],
+        tile_size: [u32; 2],
+        total_tiles: [u32; 2],
+        triangles_per_buffer: u32,
+        metadata_offsets: SceneMetadataOffsets,
+        color_channel: u32,
+        current_bounce_depth: u32,
+        max_bounce_depth: u32,
+        frame_seed: u32,
+    ) -> Self {
+        let packed_flags = Self::pack_flags(color_channel, current_bounce_depth, max_bounce_depth, 1);
+        Self {
+            resolution,
+            camera,
+            triangle_count,
+            material_count,
+            tile_offset,
+            tile_size_packed: Self::pack_tile_size(tile_size[0], tile_size[1]),
+            total_tiles,
+            triangles_per_buffer,
+            metadata_offsets,
+            packed_flags,
+            frame_seed,
+        }
+    }
+    
+    /// Pack tile size values into a single u32
+    /// Layout: width(low 16 bits) + height(high 16 bits)
+    pub fn pack_tile_size(width: u32, height: u32) -> u32 {
+        let width_u16 = (width.min(65535)) as u16; // Clamp to u16 range
+        let height_u16 = (height.min(65535)) as u16; // Clamp to u16 range
+        (width_u16 as u32) | ((height_u16 as u32) << 16)
+    }
+
+    /// Unpack tile size values from packed u32
+    /// Returns (width, height) as u32 values
+    pub fn unpack_tile_size(&self) -> (u32, u32) {
+        let width = (self.tile_size_packed & 0x0000FFFF) as u32;
+        let height = ((self.tile_size_packed >> 16) & 0x0000FFFF) as u32;
+        (width, height)
+    }
+
+    /// Pack flags into a single u32
+    /// Layout: color_channel(0-7), current_bounce_depth(8-15), max_bounce_depth(16-23), wavefront_mode(24-31)
+    pub fn pack_flags(color_channel: u32, current_bounce_depth: u32, max_bounce_depth: u32, wavefront_mode: u32) -> u32 {
+        (color_channel & 0xFF) | 
+        ((current_bounce_depth & 0xFF) << 8) |
+        ((max_bounce_depth & 0xFF) << 16) |
+        ((wavefront_mode & 0xFF) << 24)
+    }
+    
+    /// Extract color channel from packed flags
+    pub fn color_channel(&self) -> u32 {
+        self.packed_flags & 0xFF
+    }
+    
+    /// Extract current bounce depth from packed flags
+    pub fn current_bounce_depth(&self) -> u32 {
+        (self.packed_flags >> 8) & 0xFF
+    }
+    
+    /// Extract max bounce depth from packed flags
+    pub fn max_bounce_depth(&self) -> u32 {
+        (self.packed_flags >> 16) & 0xFF
+    }
+    
+    /// Extract wavefront mode from packed flags
+    pub fn wavefront_mode(&self) -> u32 {
+        (self.packed_flags >> 24) & 0xFF
     }
 }
 
@@ -1126,6 +1451,6 @@ mod test {
         assert_eq!(constants.triangle_count, 20);
         assert_eq!(constants.metadata_offsets.spheres_count, 10);
         assert_eq!(constants.metadata_offsets.lights_count, 2);
-        assert_eq!(constants.color_channel, 0);
+        assert_eq!(constants.color_channel(), 0);
     }
 }

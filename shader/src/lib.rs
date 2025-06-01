@@ -7,6 +7,7 @@ mod lighting;
 mod material;
 mod scene_access;
 mod triangle_access;
+mod wavefront;
 
 use spirv_std::spirv;
 use spirv_std::glam::{vec2, vec3, vec4, Vec2, Vec4, UVec2, Vec3};
@@ -19,6 +20,7 @@ use lighting::LightingCalculator;
 use material::MaterialEvaluator;
 use scene_access::SceneAccessor;
 use triangle_access::TriangleAccessor;
+use wavefront::{SimpleRng, generate_camera_ray, process_wavefront_ray};
 
 #[spirv(compute(threads(16, 16)))]
 pub fn main_cs(
@@ -39,7 +41,6 @@ pub fn main_cs(
     }
 
     let pixel_coords = calculate_pixel_coordinates(id, push_constants);
-    let camera_ray = Ray::from_screen_coordinates(pixel_coords, push_constants);
     
     // Initialize scene accessor for buffer access
     let scene_accessor = SceneAccessor::new(scene_metadata, push_constants);
@@ -47,26 +48,38 @@ pub fn main_cs(
     // Initialize BVH traverser
     let bvh_traverser = BvhTraverser::new(&scene_accessor);
     
-    // Find closest intersection
-    let intersection_result = find_closest_intersection(
-        &camera_ray, 
-        &scene_accessor, 
-        &bvh_traverser,
-        triangles_buffer_0,
-        triangles_buffer_1, 
-        triangles_buffer_2,
-        push_constants
-    );
-    
-    // Calculate final color based on color channel
-    let final_color = if intersection_result.hit {
-        calculate_shading(&intersection_result.intersection, &camera_ray, &scene_accessor, materials, push_constants)
+    let final_color = if push_constants.wavefront_mode() != 0 {
+        // Wavefront raytracing mode
+        run_wavefront_raytracing(
+            pixel_coords, &scene_accessor, &bvh_traverser,
+            triangles_buffer_0, triangles_buffer_1, triangles_buffer_2,
+            materials, push_constants
+        )
     } else {
-        vec3(0.0, 0.0, 0.0) // Sky color
+        // Legacy single-ray mode
+        let camera_ray = Ray::from_screen_coordinates(pixel_coords, push_constants);
+        
+        // Find closest intersection
+        let intersection_result = find_closest_intersection(
+            &camera_ray, 
+            &scene_accessor, 
+            &bvh_traverser,
+            triangles_buffer_0,
+            triangles_buffer_1, 
+            triangles_buffer_2,
+            push_constants
+        );
+        
+        // Calculate final color based on color channel
+        if intersection_result.hit {
+            calculate_shading(&intersection_result.intersection, &camera_ray, &scene_accessor, materials, push_constants)
+        } else {
+            vec3(0.0, 0.0, 0.0) // Sky color
+        }
     };
     
     // Filter color by channel for chromatic aberration
-    let channel_filtered_color = filter_color_by_channel(final_color, push_constants.color_channel);
+    let channel_filtered_color = filter_color_by_channel(final_color, push_constants.color_channel());
     
     // Write to output
     let output_color = vec4(channel_filtered_color.x, channel_filtered_color.y, channel_filtered_color.z, 1.0);
@@ -75,17 +88,78 @@ pub fn main_cs(
     }
 }
 
+/// Run wavefront raytracing for a pixel
+fn run_wavefront_raytracing(
+    pixel_coords: UVec2,
+    scene_accessor: &SceneAccessor,
+    bvh_traverser: &BvhTraverser,
+    triangles_buffer_0: &[Triangle],
+    triangles_buffer_1: &[Triangle],
+    triangles_buffer_2: &[Triangle],
+    materials: &[Material],
+    push_constants: &PushConstants,
+) -> Vec3 {
+    // Create RNG with pixel-specific seed
+    let pixel_seed = push_constants.frame_seed
+        .wrapping_add(pixel_coords.x)
+        .wrapping_add(pixel_coords.y.wrapping_mul(push_constants.resolution[0] as u32));
+    let mut rng = SimpleRng::new(pixel_seed);
+    
+    // Generate camera ray for this pixel  
+    let mut wavefront_ray = generate_camera_ray(
+        pixel_coords.x, pixel_coords.y, push_constants, push_constants.color_channel()
+    );
+    
+    let mut accumulated_color = vec3(0.0, 0.0, 0.0);
+    
+    // Process ray for the current bounce depth only
+    // In a full wavefront implementation, this would be done across all pixels for each bounce depth
+    for bounce in 0..=push_constants.max_bounce_depth() {
+        if bounce != push_constants.current_bounce_depth() {
+            continue;
+        }
+        
+        if wavefront_ray.active == 0 {
+            break;
+        }
+        
+        let (color_contribution, contributed) = process_wavefront_ray(
+            &wavefront_ray,
+            scene_accessor,
+            bvh_traverser,
+            triangles_buffer_0,
+            triangles_buffer_1,
+            triangles_buffer_2,
+            materials,
+            push_constants,
+            &mut rng,
+        );
+        
+        if contributed {
+            accumulated_color += color_contribution;
+        }
+        
+        // For this simplified implementation, terminate after first intersection
+        // In a full implementation, this would generate continuation rays
+        wavefront_ray.active = 0;
+        break;
+    }
+    
+    accumulated_color
+}
+
 /// Check if pixel is within bounds
 fn is_pixel_in_bounds(id: spirv_std::glam::UVec3, push_constants: &PushConstants) -> bool {
     let pixel_x = push_constants.tile_offset[0] + id.x;
     let pixel_y = push_constants.tile_offset[1] + id.y;
     let width = push_constants.resolution[0] as u32;
     let height = push_constants.resolution[1] as u32;
-    
-    id.x < push_constants.tile_size[0] &&
-    id.y < push_constants.tile_size[1] &&
-    pixel_x < width &&
-    pixel_y < height
+
+    let (tile_width, tile_height) = push_constants.unpack_tile_size();
+    id.x < tile_width &&
+        id.y < tile_height &&
+        pixel_x < width &&
+        pixel_y < height
 }
 
 /// Calculate pixel coordinates
@@ -250,7 +324,7 @@ fn calculate_shading(
     
     // Calculate color contribution based on wavelength-dependent IOR
     if transmission_factor > 0.0 {
-        let wavelength_ior = material_eval.ior_for_channel(push_constants.color_channel);
+        let wavelength_ior = material_eval.ior_for_channel(push_constants.color_channel());
         
         // Simple chromatic dispersion simulation
         // Higher IOR means more bending, which affects color intensity

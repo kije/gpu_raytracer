@@ -1,5 +1,5 @@
 use bytemuck;
-use raytracer_shared::{PushConstants, RaytracerConfig};
+use raytracer_shared::{PushConstants, RaytracerConfig, WavefrontRay, WavefrontCounters};
 use crate::renderer::{RenderState, ProgressiveState, PerformanceState, TimingBreakdown, ProgressiveTiming};
 use crate::buffers::BufferManager;
 use crate::scene::SceneState;
@@ -360,5 +360,194 @@ impl ComputeRenderer {
         println!("│  • P95:          {:.2}ms                                   │", p95);
         println!("│  • P99:          {:.2}ms                                   │", p99);
         println!("└─────────────────────────────────────────────────────────────┘");
+    }
+
+    /// Run wavefront raytracing with multiple bounce depths
+    /// This is the main entry point for the new wavefront raytracing system
+    pub fn run_wavefront_compute(
+        render: &mut RenderState,
+        buffers: &mut BufferManager,
+        scene: &SceneState,
+        progressive: &mut ProgressiveState,
+        performance: &mut PerformanceState,
+        max_bounce_depth: u32,
+    ) {
+        let frame_start = std::time::Instant::now();
+        let frame_seed = frame_start.elapsed().as_nanos() as u32; // Simple frame seed
+        
+        // Handle progressive rendering state
+        if !Self::handle_progressive_rendering_setup(progressive, performance) {
+            return;
+        }
+
+        let total_tiles = progressive.tiles_x * progressive.tiles_y;
+        if Self::check_rendering_completion(progressive, performance, total_tiles) {
+            return;
+        }
+
+        let tiles_this_frame = Self::calculate_tiles_for_frame(progressive, total_tiles);
+        
+        // Time buffer updates
+        let buffer_update_start = std::time::Instant::now();
+        let metadata_offsets = Self::update_buffers_and_bind_groups(render, buffers, scene);
+        let buffer_update_time = buffer_update_start.elapsed();
+        
+        // Time wavefront compute execution
+        let compute_start = std::time::Instant::now();
+        Self::execute_wavefront_compute_pass(
+            render, buffers, scene, progressive, performance, 
+            tiles_this_frame, metadata_offsets, max_bounce_depth, frame_seed
+        );
+        let compute_submission_time = compute_start.elapsed();
+        
+        let total_frame_time = frame_start.elapsed();
+        
+        // Update performance metrics with detailed timing breakdown
+        Self::update_performance_with_timing(
+            progressive, performance, tiles_this_frame, total_tiles,
+            buffer_update_time, compute_submission_time, total_frame_time
+        );
+    }
+
+    /// Execute wavefront raytracing compute passes for each bounce depth
+    fn execute_wavefront_compute_pass(
+        render: &mut RenderState,
+        buffers: &BufferManager,
+        scene: &SceneState,
+        progressive: &ProgressiveState,
+        _performance: &PerformanceState,
+        tiles_this_frame: u32,
+        metadata_offsets: raytracer_shared::SceneMetadataOffsets,
+        max_bounce_depth: u32,
+        frame_seed: u32,
+    ) {
+        let mut encoder = render.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Wavefront Compute Encoder"),
+        });
+
+        // Initialize wavefront counters
+        let mut wavefront_counters = WavefrontCounters::new(max_bounce_depth, frame_seed);
+        
+        // Calculate total rays needed for all tiles this frame
+        let mut total_rays_needed = 0u32;
+        for i in 0..tiles_this_frame {
+            let tile_index = progressive.current_tile + i;
+            let (_, _, actual_tile_width, actual_tile_height) = 
+                Self::calculate_tile_dimensions(tile_index, progressive, render);
+            total_rays_needed += actual_tile_width * actual_tile_height * 3; // 3 color channels
+        }
+        
+        // Add camera rays for bounce depth 0
+        wavefront_counters.add_rays(0, total_rays_needed);
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Wavefront Compute Pass"),
+            });
+
+            compute_pass.set_pipeline(&render.compute_pipeline);
+
+            // Process each bounce depth sequentially
+            for bounce_depth in 0..=max_bounce_depth {
+                if !wavefront_counters.has_active_rays(bounce_depth) {
+                    continue;
+                }
+
+                let ray_count = wavefront_counters.get_ray_count(bounce_depth);
+                println!("Processing bounce depth {} with {} rays", bounce_depth, ray_count);
+
+                // Process all tiles for this bounce depth
+                for i in 0..tiles_this_frame {
+                    Self::process_tile_wavefront(
+                        &mut compute_pass, render, buffers, scene, progressive,
+                        i, metadata_offsets, bounce_depth, max_bounce_depth, frame_seed
+                    );
+                }
+
+                // Note: In a real implementation, we would update ray counts based on 
+                // how many rays were generated for the next bounce depth.
+                // For this initial implementation, we simulate termination.
+                let continuation_rate = 0.7f32.powf(bounce_depth as f32); // Exponential decay
+                let next_ray_count = (ray_count as f32 * continuation_rate) as u32;
+                if bounce_depth < max_bounce_depth && next_ray_count > 0 {
+                    wavefront_counters.add_rays(bounce_depth + 1, next_ray_count);
+                }
+            }
+        }
+
+        render.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Process a single tile with wavefront raytracing for a specific bounce depth
+    fn process_tile_wavefront<'a>(
+        compute_pass: &mut wgpu::ComputePass<'a>,
+        render: &'a RenderState,
+        buffers: &BufferManager,
+        scene: &SceneState,
+        progressive: &ProgressiveState,
+        tile_index_offset: u32,
+        metadata_offsets: raytracer_shared::SceneMetadataOffsets,
+        current_bounce_depth: u32,
+        max_bounce_depth: u32,
+        frame_seed: u32,
+    ) {
+        let tile_index = progressive.current_tile + tile_index_offset;
+        let (tile_offset_x, tile_offset_y, actual_tile_width, actual_tile_height) = 
+            Self::calculate_tile_dimensions(tile_index, progressive, render);
+
+        // Process all three color channels for each tile at this bounce depth
+        for color_channel in 0..3 {
+            Self::process_color_channel_wavefront(
+                compute_pass, render, buffers, scene, progressive,
+                tile_offset_x, tile_offset_y, actual_tile_width, actual_tile_height,
+                color_channel, metadata_offsets, current_bounce_depth, max_bounce_depth, frame_seed
+            );
+        }
+    }
+
+    /// Process a single color channel for a tile with wavefront raytracing
+    fn process_color_channel_wavefront<'a>(
+        compute_pass: &mut wgpu::ComputePass<'a>,
+        render: &'a RenderState,
+        buffers: &BufferManager,
+        scene: &SceneState,
+        progressive: &ProgressiveState,
+        tile_offset_x: u32,
+        tile_offset_y: u32,
+        actual_tile_width: u32,
+        actual_tile_height: u32,
+        color_channel: u32,
+        metadata_offsets: raytracer_shared::SceneMetadataOffsets,
+        current_bounce_depth: u32,
+        max_bounce_depth: u32,
+        frame_seed: u32,
+    ) {
+        // Set the appropriate bind group for this color channel
+        let bind_group = render.get_compute_bind_group(color_channel)
+            .expect("Invalid color channel");
+        compute_pass.set_bind_group(0, bind_group, &[]);
+        
+        let push_constants = PushConstants::new_wavefront(
+            [render.size.width as f32, render.size.height as f32],
+            scene.camera,
+            scene.triangles.len() as u32,
+            scene.materials.len() as u32,
+            [tile_offset_x, tile_offset_y],
+            [actual_tile_width, actual_tile_height],
+            [progressive.tiles_x, progressive.tiles_y],
+            buffers.triangles_per_buffer as u32,
+            metadata_offsets,
+            color_channel,
+            current_bounce_depth,
+            max_bounce_depth,
+            frame_seed,
+        );
+        
+        compute_pass.set_push_constants(0, bytemuck::cast_slice(&[push_constants]));
+
+        // Dispatch workgroups for current tile and channel
+        let workgroup_x = (actual_tile_width + RaytracerConfig::THREAD_GROUP_SIZE.0 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.0;
+        let workgroup_y = (actual_tile_height + RaytracerConfig::THREAD_GROUP_SIZE.1 - 1) / RaytracerConfig::THREAD_GROUP_SIZE.1;
+        compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
     }
 }
