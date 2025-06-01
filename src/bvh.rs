@@ -1,8 +1,9 @@
 use bvh::{
     aabb::{Aabb as BvhAabb, Bounded},
     bounding_hierarchy::BHShape,
-    bvh::Bvh as BVH,
+    bvh::{Bvh as BVH},
 };
+use bvh::bounding_hierarchy::BoundingHierarchy;
 use raytracer_shared::{Triangle, Vertex, Aabb, BvhNode};
 
 // Type aliases for specific f32 3D types
@@ -138,7 +139,7 @@ impl BvhBuilder {
             .collect();
         
         // Build BVH using the bvh crate
-        let bvh = BVHf::build(&mut bvh_triangles_with_vertices);
+        let bvh = BVHf::build_par(&mut bvh_triangles_with_vertices);
         
         // Extract the updated triangles
         for (i, wrapper) in bvh_triangles_with_vertices.iter().enumerate() {
