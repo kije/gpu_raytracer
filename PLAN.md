@@ -1,0 +1,10 @@
+- implement per-color-channel raytracing to get chromatic aberration & rainbows
+- Let the compute shader process a single color chanel at a time, and then have a separate pass to combine all channels into an rgb pixel per ray. This means each compute shader carries a rgb value and does any color calculation as well as refraction & absorption based on that color, for which we have some mapping to a wavelength
+- implement caustics with photon mapping (separate compute pass?)
+- in shared crate, can we use glam structs (Vec3 etc..) instead of arrays? Glam supports bytemuck)
+- threading to avoid sluggish ui
+- multiple compute passes, e.g. first pass to just calculate 
+- Microfacet BRDF
+- Add a way to save the scene as an image
+- Add a way to load a saved scene from file
+- reduce size of shared/transfered structs so we can utilize the gpu more efficently. Packing fields together etc...
